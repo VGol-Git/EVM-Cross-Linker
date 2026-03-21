@@ -1,0 +1,12 @@
+requests
+pandas
+numpy
+matplotlib
+pyarrow
+jupyterlab
+notebook
+ipykernel
+black
+ruff
+mypy
+pytest
