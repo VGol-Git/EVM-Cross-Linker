@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from normalize import NormalizationConfig, build_cross_chain_address_summary
+from .normalize import NormalizationConfig, build_cross_chain_address_summary
 
 logger = logging.getLogger(__name__)
 

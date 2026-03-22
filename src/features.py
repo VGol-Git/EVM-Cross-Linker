@@ -13,8 +13,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import pandas as pd
 
-from api_client import EtherscanClient
-from config import AppConfig, ChainConfig
+from .api_client import EtherscanClient
+from .config import AppConfig, ChainConfig
 
 logger = logging.getLogger(__name__)
 

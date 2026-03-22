@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
-from config import APIConfig, ChainConfig
+from .config import APIConfig, ChainConfig
 
 logger = logging.getLogger(__name__)
 

@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
-from api_client import EtherscanClient
-from config import AppConfig, ChainConfig
+from .api_client import EtherscanClient
+from .config import AppConfig, ChainConfig
 
 logger = logging.getLogger(__name__)
 
