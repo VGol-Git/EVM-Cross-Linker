@@ -1,0 +1,24 @@
+{
+  "address": "0x0d0707963952f2fba59dd06f2b425ace40b492fe",
+  "chain": "ethereum",
+  "chain_id": 1,
+  "fetched_at": "2026-03-26T05:15:34.853508+00:00",
+  "snapshot_ts": 1774502134,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 0,
+      "rows": []
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}
