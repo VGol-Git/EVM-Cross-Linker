@@ -148,6 +148,28 @@ def _to_optional_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def _coerce_bool_series(series: pd.Series) -> pd.Series:
+    return series.map(_to_bool).fillna(False).astype(bool)
+
+
+def _coerce_status_df_boolean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    for col in [
+        "is_present",
+        "is_active",
+        "is_passive",
+        "seen_as_from",
+        "seen_as_to",
+    ]:
+        if col in out.columns:
+            out[col] = _coerce_bool_series(out[col])
+
+    return out
+
+
 def _to_bool(value: Any) -> bool:
     parsed = _to_optional_bool(value)
     return bool(parsed) if parsed is not None else False
@@ -609,7 +631,7 @@ def load_address_status_table(
     chain: ChainConfig,
     window_blocks: int,
 ) -> pd.DataFrame:
-    return _load_table_as_dataframe(
+    df = _load_table_as_dataframe(
         path_without_suffix=address_status_table_path_base(
             app_config=app_config,
             chain=chain,
@@ -617,7 +639,7 @@ def load_address_status_table(
         ),
         table_format=app_config.storage.table_format,
     )
-
+    return _coerce_status_df_boolean_columns(df)
 
 # ============================================================
 # Set builders
@@ -664,7 +686,7 @@ def build_presence_matrix(
         tmp = df[["address", status_column]].copy()
         tmp["address"] = tmp["address"].astype(str).str.lower()
         tmp = tmp.rename(columns={status_column: chain_name})
-        tmp[chain_name] = tmp[chain_name].fillna(False).astype(bool)
+        tmp[chain_name] = _coerce_bool_series(tmp[chain_name])
         frames.append(tmp)
 
     if not frames:
@@ -813,8 +835,11 @@ def compute_mixed_overlap_table(
             )
 
         address_series = df["address"].astype(str).str.lower()
-        left_set = set(address_series[df[left_status_column].fillna(False)])
-        right_set = set(address_series[df[right_status_column].fillna(False)])
+        left_mask = _coerce_bool_series(df[left_status_column])
+        right_mask = _coerce_bool_series(df[right_status_column])
+
+        left_set = set(address_series[left_mask])
+        right_set = set(address_series[right_mask])
         sets_by_chain[chain_name] = (left_set, right_set)
 
     rows: List[Dict[str, Any]] = []
