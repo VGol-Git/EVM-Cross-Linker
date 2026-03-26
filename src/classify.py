@@ -1,477 +1,1057 @@
-# Classification module
+# classify.py
+# Active / Passive classification and cross-chain matching layer
+# for the block-window version of the project.
 
 from __future__ import annotations
 
-import json
+import itertools
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import numpy as np
 import pandas as pd
 
-from .normalize import NormalizationConfig, build_cross_chain_address_summary
+from .config import AppConfig, ChainConfig
+from .sampling import (
+    address_code_snapshot_path_base,
+    address_observation_table_path_base,
+    enriched_transaction_table_path_base,
+    read_table,
+    write_table,
+)
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+# ============================================================
+# Configuration
+# ============================================================
+
+
+@dataclass(frozen=True)
 class ClassificationConfig:
     """
-    Rule-based classification thresholds for cross-chain wallet behavior.
+    Configuration for address-level classification inside one chain/window.
     """
 
-    min_total_tx_across_chains: int = 3
-    min_recent_30d_tx_for_active: int = 1
+    min_nonce_for_active: int = 1
+    require_eoa: bool = True
+    allow_unknown_eoa: bool = False
 
-    dormant_threshold_days: int = 90
-    dormant_recent_90d_max_tx: int = 0
-
-    migrator_min_active_chains: int = 2
-    migrator_min_total_tx_across_chains: int = 10
-    migrator_min_recent_30d_total_tx: int = 3
-
-    migrator_historical_share_min: float = 0.60
-    migrator_recent_share_min: float = 0.60
-    migrator_old_chain_recent_share_max: float = 0.15
-    migrator_new_chain_historical_share_max: float = 0.30
-    migrator_dominance_gap_min: float = 0.20
-
-    migrator_min_signal_score: int = 5
-
-    inactive_label: str = "inactive / insufficient activity"
-    dormant_label: str = "dormant address"
-    single_chain_label: str = "single-chain participant"
-    multi_chain_label: str = "multi-chain user"
-    migrator_label: str = "migrator-like wallet"
+    present_label: str = "present"
+    active_label: str = "active"
+    passive_label: str = "passive"
+    active_and_receiving_label: str = "active_and_receiving"
+    unclassified_present_label: str = "present_unclassified"
+    absent_label: str = "absent"
 
 
-def load_dataframe(path: str | Path) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path)
-    if path.suffix.lower() == ".parquet":
-        return pd.read_parquet(path)
-
-    raise ValueError("Supported formats: .csv, .parquet")
+# ============================================================
+# IO helpers
+# ============================================================
 
 
-def save_dataframe(df: pd.DataFrame, path: str | Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.suffix.lower() == ".csv":
-        df.to_csv(path, index=False)
-    elif path.suffix.lower() == ".parquet":
-        df.to_parquet(path, index=False)
-    else:
-        raise ValueError("Supported output formats: .csv, .parquet")
+def _load_table_as_dataframe(
+    path_without_suffix: Path,
+    table_format: str,
+) -> pd.DataFrame:
+    rows = read_table(path_without_suffix=path_without_suffix, table_format=table_format)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
-def _safe_json_dict(value: Any) -> Dict[str, float]:
+def _save_dataframe(
+    df: pd.DataFrame,
+    path_without_suffix: Path,
+    table_format: str,
+) -> Path:
+    rows = df.to_dict(orient="records")
+    return write_table(
+        rows=rows,
+        path_without_suffix=path_without_suffix,
+        table_format=table_format,
+    )
+
+
+# ============================================================
+# Path helpers
+# ============================================================
+
+
+def address_status_table_path_base(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Path:
+    return (
+        app_config.paths.interim_status_dir
+        / chain.name
+        / f"{chain.name}_window_{window_blocks}_address_status"
+    )
+
+
+def presence_matrix_path_base(
+    app_config: AppConfig,
+    window_blocks: int,
+    status_name: str,
+) -> Path:
+    return (
+        app_config.paths.processed_analysis_dir
+        / f"window_{window_blocks}_{status_name}_presence_matrix"
+    )
+
+
+def pairwise_overlap_table_path_base(
+    app_config: AppConfig,
+    window_blocks: int,
+    overlap_name: str,
+) -> Path:
+    return (
+        app_config.paths.processed_analysis_dir
+        / f"window_{window_blocks}_{overlap_name}_pairwise_overlap"
+    )
+
+
+def triple_overlap_table_path_base(
+    app_config: AppConfig,
+    window_blocks: int,
+    overlap_name: str,
+) -> Path:
+    return (
+        app_config.paths.processed_analysis_dir
+        / f"window_{window_blocks}_{overlap_name}_triple_overlap"
+    )
+
+
+# ============================================================
+# Basic coercion helpers
+# ============================================================
+
+
+def _to_optional_bool(value: Any) -> Optional[bool]:
     if value is None:
-        return {}
-    if isinstance(value, dict):
-        return {
-            str(k): float(v) if pd.notna(v) else 0.0
-            for k, v in value.items()
-        }
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "null", "nan"}:
+            return None
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+    return None
+
+
+def _to_bool(value: Any) -> bool:
+    parsed = _to_optional_bool(value)
+    return bool(parsed) if parsed is not None else False
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
     if isinstance(value, str):
         value = value.strip()
-        if not value:
-            return {}
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, dict):
-                return {
-                    str(k): float(v) if pd.notna(v) else 0.0
-                    for k, v in parsed.items()
-                }
-        except json.JSONDecodeError:
-            return {}
-    return {}
+        if value in {"", "None", "null", "nan"}:
+            return default
+        return int(float(value))
+    return int(value)
 
 
-def _normalize_share_map(metric_map: Dict[str, float]) -> Dict[str, float]:
-    total = float(sum(max(v, 0.0) for v in metric_map.values()))
-    if total <= 0:
-        return {k: 0.0 for k in metric_map}
-    return {k: max(v, 0.0) / total for k, v in metric_map.items()}
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() in {"", "None", "null", "nan"}:
+        return None
+    return _to_int(value)
 
 
-def _historical_map_from_total_and_recent90(
-    total_map: Dict[str, float],
-    recent90_map: Dict[str, float],
-) -> Dict[str, float]:
-    keys = set(total_map) | set(recent90_map)
-    return {
-        key: max(float(total_map.get(key, 0.0)) - float(recent90_map.get(key, 0.0)), 0.0)
-        for key in keys
-    }
+def _safe_address(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    if not value.startswith("0x"):
+        return None
+    if len(value) != 42:
+        return None
+    return value
 
 
-def _top_chain(metric_map: Dict[str, float]) -> Tuple[Optional[str], float, Optional[str], float]:
-    if not metric_map:
-        return None, 0.0, None, 0.0
+def _update_first_last_seen(
+    state_row: Dict[str, Any],
+    block_number: Optional[int],
+    block_timestamp: Optional[int],
+) -> None:
+    if block_number is None:
+        return
 
-    items = sorted(metric_map.items(), key=lambda kv: kv[1], reverse=True)
-    first_chain, first_value = items[0]
-    if len(items) == 1:
-        return first_chain, float(first_value), None, 0.0
+    current_first_block = state_row["first_seen_block"]
+    current_last_block = state_row["last_seen_block"]
 
-    second_chain, second_value = items[1]
-    return first_chain, float(first_value), second_chain, float(second_value)
+    if current_first_block is None or block_number < current_first_block:
+        state_row["first_seen_block"] = block_number
+        state_row["first_seen_timestamp"] = block_timestamp
 
-
-def _confidence_from_score(score: int, strong_threshold: int = 6, medium_threshold: int = 4) -> str:
-    if score >= strong_threshold:
-        return "high"
-    if score >= medium_threshold:
-        return "medium"
-    return "low"
-
-
-def _coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = df.copy()
-    for col in cols:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out
+    if current_last_block is None or block_number > current_last_block:
+        state_row["last_seen_block"] = block_number
+        state_row["last_seen_timestamp"] = block_timestamp
 
 
-def add_classification_features(summary_df: pd.DataFrame) -> pd.DataFrame:
+def _is_eoa_allowed(
+    is_eoa: Optional[bool],
+    *,
+    require_eoa: bool,
+    allow_unknown_eoa: bool,
+) -> bool:
+    if not require_eoa:
+        return True
+    if is_eoa is True:
+        return True
+    if is_eoa is None and allow_unknown_eoa:
+        return True
+    return False
+
+
+# ============================================================
+# Load chain/window inputs
+# ============================================================
+
+
+def load_chain_window_inputs(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Enrich address-level summary with derived cross-chain share metrics used by the classifier.
+    Returns:
+        transactions_enriched_df, address_observations_df, address_code_snapshot_df
     """
-    required_cols = [
-        "chain_tx_map_json",
-        "chain_recent_30d_map_json",
-        "chain_recent_90d_map_json",
-    ]
-    missing = [c for c in required_cols if c not in summary_df.columns]
-    if missing:
-        raise ValueError(
-            f"Cannot derive classification features. Missing columns: {missing}"
-        )
-
-    out = summary_df.copy()
-
-    tx_maps = out["chain_tx_map_json"].map(_safe_json_dict)
-    recent30_maps = out["chain_recent_30d_map_json"].map(_safe_json_dict)
-    recent90_maps = out["chain_recent_90d_map_json"].map(_safe_json_dict)
-
-    total_share_list = []
-    recent30_share_list = []
-    recent90_share_list = []
-    historical_map_list = []
-    historical_share_list = []
-
-    historical_dominant_share = []
-    recent_dominant_share = []
-    old_chain_recent_share = []
-    new_chain_historical_share = []
-    historical_second_share = []
-
-    for idx, row in out.iterrows():
-        total_map = tx_maps.iloc[idx]
-        recent30_map = recent30_maps.iloc[idx]
-        recent90_map = recent90_maps.iloc[idx]
-        historical_map = _historical_map_from_total_and_recent90(total_map, recent90_map)
-
-        total_shares = _normalize_share_map(total_map)
-        recent30_shares = _normalize_share_map(recent30_map)
-        recent90_shares = _normalize_share_map(recent90_map)
-        historical_shares = _normalize_share_map(historical_map)
-
-        total_share_list.append(json.dumps(total_shares, ensure_ascii=False, sort_keys=True))
-        recent30_share_list.append(json.dumps(recent30_shares, ensure_ascii=False, sort_keys=True))
-        recent90_share_list.append(json.dumps(recent90_shares, ensure_ascii=False, sort_keys=True))
-        historical_map_list.append(json.dumps(historical_map, ensure_ascii=False, sort_keys=True))
-        historical_share_list.append(json.dumps(historical_shares, ensure_ascii=False, sort_keys=True))
-
-        hist_dom = row.get("historical_dominant_chain")
-        recent_dom = row.get("recent_dominant_chain")
-
-        hist_dom_share = float(historical_shares.get(hist_dom, 0.0)) if hist_dom else 0.0
-        recent_dom_share_val = float(recent30_shares.get(recent_dom, 0.0)) if recent_dom else 0.0
-        old_recent_share_val = float(recent30_shares.get(hist_dom, 0.0)) if hist_dom else 0.0
-        new_hist_share_val = float(historical_shares.get(recent_dom, 0.0)) if recent_dom else 0.0
-
-        _, _, hist_second_chain, hist_second_value = _top_chain(historical_shares)
-        hist_second_share_val = float(hist_second_value) if hist_second_chain else 0.0
-
-        historical_dominant_share.append(hist_dom_share)
-        recent_dominant_share.append(recent_dom_share_val)
-        old_chain_recent_share.append(old_recent_share_val)
-        new_chain_historical_share.append(new_hist_share_val)
-        historical_second_share.append(hist_second_share_val)
-
-    out["chain_tx_share_map_json"] = total_share_list
-    out["chain_recent_30d_share_map_json"] = recent30_share_list
-    out["chain_recent_90d_share_map_json"] = recent90_share_list
-    out["chain_historical_tx_map_json"] = historical_map_list
-    out["chain_historical_share_map_json"] = historical_share_list
-
-    out["historical_dominant_share"] = historical_dominant_share
-    out["historical_second_share"] = historical_second_share
-    out["recent_dominant_share"] = recent_dominant_share
-    out["historical_chain_recent_share"] = old_chain_recent_share
-    out["recent_chain_historical_share"] = new_chain_historical_share
-
-    out["historical_dominance_gap"] = (
-        out["historical_dominant_share"].fillna(0.0) - out["historical_second_share"].fillna(0.0)
+    tx_df = _load_table_as_dataframe(
+        path_without_suffix=enriched_transaction_table_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
     )
 
-    return out
-
-
-def classify_address_row(
-    row: pd.Series,
-    config: ClassificationConfig,
-) -> Dict[str, Any]:
-    """
-    Classify one address summary row into a behavioral group.
-    """
-    total_tx = float(row.get("total_tx_across_chains", 0.0) or 0.0)
-    recent30 = float(row.get("recent_30d_tx_across_chains", 0.0) or 0.0)
-    recent90 = float(row.get("recent_90d_tx_across_chains", 0.0) or 0.0)
-
-    active_chain_count = int(row.get("active_chain_count", 0) or 0)
-    active_recent_chain_count = int(row.get("active_recent_chain_count", 0) or 0)
-
-    min_days_since_last = row.get("min_days_since_last_active")
-    min_days_since_last = float(min_days_since_last) if pd.notna(min_days_since_last) else np.nan
-
-    dominant_chain = row.get("dominant_chain")
-    recent_dominant_chain = row.get("recent_dominant_chain")
-    historical_dominant_chain = row.get("historical_dominant_chain")
-
-    dominant_chain_share = float(row.get("dominant_chain_share", 0.0) or 0.0)
-    dominance_gap = float(row.get("dominance_gap", 0.0) or 0.0)
-
-    historical_dominant_share = float(row.get("historical_dominant_share", 0.0) or 0.0)
-    recent_dominant_share = float(row.get("recent_dominant_share", 0.0) or 0.0)
-    historical_chain_recent_share = float(row.get("historical_chain_recent_share", 0.0) or 0.0)
-    recent_chain_historical_share = float(row.get("recent_chain_historical_share", 0.0) or 0.0)
-    historical_dominance_gap = float(row.get("historical_dominance_gap", 0.0) or 0.0)
-
-    reasons: list[str] = []
-
-    if total_tx < config.min_total_tx_across_chains:
-        return {
-            "behavioral_group": config.inactive_label,
-            "classification_confidence": "high",
-            "classification_reason": (
-                f"Total observed activity across chains is below "
-                f"min_total_tx_across_chains={config.min_total_tx_across_chains}."
-            ),
-            "migrator_signal_score": 0,
-            "is_dormant": False,
-            "is_single_chain": False,
-            "is_multi_chain": False,
-            "is_migrator_like": False,
-        }
-
-    dormant_like = (
-        pd.notna(min_days_since_last)
-        and min_days_since_last > config.dormant_threshold_days
-        and recent90 <= config.dormant_recent_90d_max_tx
+    obs_df = _load_table_as_dataframe(
+        path_without_suffix=address_observation_table_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
     )
-    if dormant_like:
-        return {
-            "behavioral_group": config.dormant_label,
-            "classification_confidence": "high",
-            "classification_reason": (
-                f"No meaningful recent activity in the last 90 days and "
-                f"min_days_since_last_active={min_days_since_last:.1f} > "
-                f"dormant_threshold_days={config.dormant_threshold_days}."
-            ),
-            "migrator_signal_score": 0,
-            "is_dormant": True,
-            "is_single_chain": False,
-            "is_multi_chain": False,
-            "is_migrator_like": False,
-        }
 
-    if active_chain_count == 1:
-        chain_name = row.get("active_chains", "") or dominant_chain or "unknown"
-        return {
-            "behavioral_group": config.single_chain_label,
-            "classification_confidence": "high",
-            "classification_reason": (
-                f"Meaningful activity detected on exactly one chain: {chain_name}."
-            ),
-            "migrator_signal_score": 0,
-            "is_dormant": False,
-            "is_single_chain": True,
-            "is_multi_chain": False,
-            "is_migrator_like": False,
-        }
-
-    # Migrator-like scoring
-    signal_score = 0
-
-    if active_chain_count >= config.migrator_min_active_chains:
-        signal_score += 1
-        reasons.append("active on at least two chains")
-
-    if total_tx >= config.migrator_min_total_tx_across_chains:
-        signal_score += 1
-        reasons.append("enough total cross-chain activity")
-
-    if recent30 >= config.migrator_min_recent_30d_total_tx:
-        signal_score += 1
-        reasons.append("enough recent activity")
-
-    if historical_dominant_chain and recent_dominant_chain and historical_dominant_chain != recent_dominant_chain:
-        signal_score += 1
-        reasons.append("historical dominant chain differs from recent dominant chain")
-
-    if historical_dominant_share >= config.migrator_historical_share_min:
-        signal_score += 1
-        reasons.append(
-            f"historical dominant share={historical_dominant_share:.2f} "
-            f">= {config.migrator_historical_share_min:.2f}"
-        )
-
-    if recent_dominant_share >= config.migrator_recent_share_min:
-        signal_score += 1
-        reasons.append(
-            f"recent dominant share={recent_dominant_share:.2f} "
-            f">= {config.migrator_recent_share_min:.2f}"
-        )
-
-    if historical_chain_recent_share <= config.migrator_old_chain_recent_share_max:
-        signal_score += 1
-        reasons.append(
-            f"old dominant chain recent share={historical_chain_recent_share:.2f} "
-            f"<= {config.migrator_old_chain_recent_share_max:.2f}"
-        )
-
-    if recent_chain_historical_share <= config.migrator_new_chain_historical_share_max:
-        signal_score += 1
-        reasons.append(
-            f"new dominant chain historical share={recent_chain_historical_share:.2f} "
-            f"<= {config.migrator_new_chain_historical_share_max:.2f}"
-        )
-
-    if dominance_gap >= config.migrator_dominance_gap_min:
-        signal_score += 1
-        reasons.append(
-            f"current dominance gap={dominance_gap:.2f} "
-            f">= {config.migrator_dominance_gap_min:.2f}"
-        )
-
-    if historical_dominance_gap >= config.migrator_dominance_gap_min:
-        signal_score += 1
-        reasons.append(
-            f"historical dominance gap={historical_dominance_gap:.2f} "
-            f">= {config.migrator_dominance_gap_min:.2f}"
-        )
-
-    if signal_score >= config.migrator_min_signal_score:
-        return {
-            "behavioral_group": config.migrator_label,
-            "classification_confidence": _confidence_from_score(signal_score),
-            "classification_reason": "; ".join(reasons),
-            "migrator_signal_score": signal_score,
-            "is_dormant": False,
-            "is_single_chain": False,
-            "is_multi_chain": True,
-            "is_migrator_like": True,
-        }
-
-    # Default multi-chain bucket
-    multi_chain_reason = (
-        f"Meaningful activity on {active_chain_count} chains; "
-        f"recently active on {active_recent_chain_count} chains; "
-        f"migrator signal score={signal_score}."
+    code_df = _load_table_as_dataframe(
+        path_without_suffix=address_code_snapshot_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
     )
-    return {
-        "behavioral_group": config.multi_chain_label,
-        "classification_confidence": "high" if active_chain_count >= 3 else "medium",
-        "classification_reason": multi_chain_reason,
-        "migrator_signal_score": signal_score,
-        "is_dormant": False,
-        "is_single_chain": False,
-        "is_multi_chain": True,
-        "is_migrator_like": False,
-    }
+
+    return tx_df, obs_df, code_df
 
 
-def classify_address_summary(
-    summary_df: pd.DataFrame,
+# ============================================================
+# Address status construction
+# ============================================================
+
+
+def build_address_status_table(
+    transactions_df: pd.DataFrame,
+    observations_df: pd.DataFrame,
+    address_code_df: pd.DataFrame,
+    *,
     config: Optional[ClassificationConfig] = None,
 ) -> pd.DataFrame:
     """
-    Classify an address-level summary table into behavioral groups.
+    Build one row per address for one specific chain and one specific block window.
+
+    Output columns include:
+    - is_present
+    - is_active
+    - is_passive
+    - sent/received counts
+    - sent/received value
+    - nonce summary
+    - first/last seen
+    - unique_counterparties
     """
     config = config or ClassificationConfig()
 
-    out = summary_df.copy()
-    numeric_cols = [
-        "total_tx_across_chains",
-        "recent_30d_tx_across_chains",
-        "recent_90d_tx_across_chains",
-        "active_chain_count",
-        "active_recent_chain_count",
-        "dominant_chain_share",
-        "dominance_gap",
-        "min_days_since_last_active",
-        "max_days_since_last_active",
-        "mean_activity_score",
-    ]
-    out = _coerce_numeric(out, numeric_cols)
-    out = add_classification_features(out)
+    state: Dict[str, Dict[str, Any]] = {}
 
-    classified_rows = []
-    for _, row in out.iterrows():
-        classified_rows.append(classify_address_row(row, config))
+    def ensure(address: str) -> Dict[str, Any]:
+        if address not in state:
+            state[address] = {
+                "chain": None,
+                "chain_id": None,
+                "window_blocks": None,
+                "reference_block_number": None,
+                "address": address,
+                "is_eoa": None,
+                "seen_as_from": False,
+                "seen_as_to": False,
+                "sent_tx_count": 0,
+                "received_tx_count": 0,
+                "value_sent_wei": 0,
+                "value_received_wei": 0,
+                "sender_nonce_min": None,
+                "sender_nonce_max": None,
+                "first_seen_block": None,
+                "last_seen_block": None,
+                "first_seen_timestamp": None,
+                "last_seen_timestamp": None,
+                "counterparties": set(),
+            }
+        return state[address]
 
-    classified_df = pd.concat(
-        [out.reset_index(drop=True), pd.DataFrame(classified_rows)],
-        axis=1,
+    # --------------------------------------------------------
+    # Step 1. Address code snapshot → authoritative EOA flag
+    # --------------------------------------------------------
+    if not address_code_df.empty:
+        for _, row in address_code_df.iterrows():
+            address = _safe_address(row.get("address"))
+            if address is None:
+                continue
+
+            status = ensure(address)
+            status["chain"] = row.get("chain", status["chain"])
+            status["chain_id"] = _to_optional_int(row.get("chain_id")) or status["chain_id"]
+            status["is_eoa"] = _to_optional_bool(row.get("is_eoa"))
+
+    # --------------------------------------------------------
+    # Step 2. Observations → presence / first-last seen fallback
+    # --------------------------------------------------------
+    if not observations_df.empty:
+        for _, row in observations_df.iterrows():
+            address = _safe_address(row.get("address"))
+            if address is None:
+                continue
+
+            status = ensure(address)
+
+            status["chain"] = row.get("chain", status["chain"])
+            status["chain_id"] = _to_optional_int(row.get("chain_id")) or status["chain_id"]
+            status["window_blocks"] = (
+                _to_optional_int(row.get("window_blocks")) or status["window_blocks"]
+            )
+            status["reference_block_number"] = (
+                _to_optional_int(row.get("reference_block_number"))
+                or status["reference_block_number"]
+            )
+
+            status["seen_as_from"] = status["seen_as_from"] or _to_bool(row.get("seen_as_from"))
+            status["seen_as_to"] = status["seen_as_to"] or _to_bool(row.get("seen_as_to"))
+
+            # status["sent_tx_count"] = max(
+            #     status["sent_tx_count"],
+            #     _to_int(row.get("tx_count_as_from"), default=0),
+            # )
+            # status["received_tx_count"] = max(
+            #     status["received_tx_count"],
+            #     _to_int(row.get("tx_count_as_to"), default=0),
+            # )
+
+            first_seen_block = _to_optional_int(row.get("first_seen_block"))
+            last_seen_block = _to_optional_int(row.get("last_seen_block"))
+            first_seen_ts = _to_optional_int(row.get("first_seen_timestamp"))
+            last_seen_ts = _to_optional_int(row.get("last_seen_timestamp"))
+
+            if first_seen_block is not None:
+                _update_first_last_seen(status, first_seen_block, first_seen_ts)
+            if last_seen_block is not None:
+                _update_first_last_seen(status, last_seen_block, last_seen_ts)
+
+    # --------------------------------------------------------
+    # Step 3. Enriched transactions → sender/receiver metrics
+    # --------------------------------------------------------
+    if not transactions_df.empty:
+        for _, row in transactions_df.iterrows():
+            chain = row.get("chain")
+            chain_id = _to_optional_int(row.get("chain_id"))
+            window_blocks = _to_optional_int(row.get("window_blocks"))
+            reference_block_number = _to_optional_int(row.get("reference_block_number"))
+
+            block_number = _to_optional_int(row.get("block_number"))
+            block_timestamp = _to_optional_int(row.get("block_timestamp"))
+            nonce = _to_int(row.get("nonce"), default=0)
+            value_wei = _to_int(row.get("value_wei"), default=0)
+
+            from_address = _safe_address(row.get("from_address"))
+            to_address = _safe_address(row.get("to_address"))
+
+            from_is_eoa = _to_optional_bool(row.get("from_is_eoa"))
+            to_is_eoa = _to_optional_bool(row.get("to_is_eoa"))
+
+            # Sender side
+            if from_address is not None and _is_eoa_allowed(
+                from_is_eoa,
+                require_eoa=config.require_eoa,
+                allow_unknown_eoa=config.allow_unknown_eoa,
+            ):
+                status = ensure(from_address)
+                status["chain"] = chain or status["chain"]
+                status["chain_id"] = chain_id or status["chain_id"]
+                status["window_blocks"] = window_blocks or status["window_blocks"]
+                status["reference_block_number"] = (
+                    reference_block_number or status["reference_block_number"]
+                )
+                if status["is_eoa"] is None:
+                    status["is_eoa"] = from_is_eoa
+
+                status["seen_as_from"] = True
+                status["sent_tx_count"] += 1
+                status["value_sent_wei"] += value_wei
+
+                current_nonce_min = status["sender_nonce_min"]
+                current_nonce_max = status["sender_nonce_max"]
+
+                if current_nonce_min is None or nonce < current_nonce_min:
+                    status["sender_nonce_min"] = nonce
+                if current_nonce_max is None or nonce > current_nonce_max:
+                    status["sender_nonce_max"] = nonce
+
+                _update_first_last_seen(status, block_number, block_timestamp)
+
+                if to_address is not None:
+                    status["counterparties"].add(to_address)
+
+            # Receiver side
+            if to_address is not None and _is_eoa_allowed(
+                to_is_eoa,
+                require_eoa=config.require_eoa,
+                allow_unknown_eoa=config.allow_unknown_eoa,
+            ):
+                status = ensure(to_address)
+                status["chain"] = chain or status["chain"]
+                status["chain_id"] = chain_id or status["chain_id"]
+                status["window_blocks"] = window_blocks or status["window_blocks"]
+                status["reference_block_number"] = (
+                    reference_block_number or status["reference_block_number"]
+                )
+                if status["is_eoa"] is None:
+                    status["is_eoa"] = to_is_eoa
+
+                status["seen_as_to"] = True
+                status["received_tx_count"] += 1
+                status["value_received_wei"] += value_wei
+
+                _update_first_last_seen(status, block_number, block_timestamp)
+
+                if from_address is not None:
+                    status["counterparties"].add(from_address)
+
+    # --------------------------------------------------------
+    # Step 4. Final row construction + classification flags
+    # --------------------------------------------------------
+    rows: List[Dict[str, Any]] = []
+
+    for address, payload in sorted(state.items()):
+        seen_as_from = bool(payload["seen_as_from"])
+        seen_as_to = bool(payload["seen_as_to"])
+        is_eoa = payload["is_eoa"]
+
+        is_present = (
+            (seen_as_from or seen_as_to)
+            and _is_eoa_allowed(
+                is_eoa,
+                require_eoa=config.require_eoa,
+                allow_unknown_eoa=config.allow_unknown_eoa,
+            )
+        )
+
+        sender_nonce_max = payload["sender_nonce_max"]
+        is_active = bool(
+            is_present
+            and seen_as_from
+            and sender_nonce_max is not None
+            and sender_nonce_max >= config.min_nonce_for_active
+        )
+        is_passive = bool(is_present and seen_as_to and not seen_as_from)
+
+        if not is_present:
+            participation_label = config.absent_label
+        elif is_active and seen_as_to:
+            participation_label = config.active_and_receiving_label
+        elif is_active:
+            participation_label = config.active_label
+        elif is_passive:
+            participation_label = config.passive_label
+        else:
+            participation_label = config.unclassified_present_label
+
+        sent_tx_count = int(payload["sent_tx_count"])
+        received_tx_count = int(payload["received_tx_count"])
+        total_tx_count = sent_tx_count + received_tx_count
+
+        value_sent_wei = int(payload["value_sent_wei"])
+        value_received_wei = int(payload["value_received_wei"])
+
+        avg_sent_value_wei = (
+            value_sent_wei / sent_tx_count if sent_tx_count > 0 else 0.0
+        )
+        avg_received_value_wei = (
+            value_received_wei / received_tx_count if received_tx_count > 0 else 0.0
+        )
+
+        rows.append(
+            {
+                "chain": payload["chain"],
+                "chain_id": payload["chain_id"],
+                "window_blocks": payload["window_blocks"],
+                "reference_block_number": payload["reference_block_number"],
+                "address": address,
+                "is_eoa": is_eoa,
+                "is_present": is_present,
+                "is_active": is_active,
+                "is_passive": is_passive,
+                "seen_as_from": seen_as_from,
+                "seen_as_to": seen_as_to,
+                "participation_label": participation_label,
+                "sent_tx_count": sent_tx_count,
+                "received_tx_count": received_tx_count,
+                "total_tx_count": total_tx_count,
+                "value_sent_wei": value_sent_wei,
+                "value_received_wei": value_received_wei,
+                "avg_sent_value_wei": avg_sent_value_wei,
+                "avg_received_value_wei": avg_received_value_wei,
+                "sender_nonce_min": payload["sender_nonce_min"],
+                "sender_nonce_max": payload["sender_nonce_max"],
+                "first_seen_block": payload["first_seen_block"],
+                "last_seen_block": payload["last_seen_block"],
+                "first_seen_timestamp": payload["first_seen_timestamp"],
+                "last_seen_timestamp": payload["last_seen_timestamp"],
+                "unique_counterparties": len(payload["counterparties"]),
+                "tx_frequency_per_block": (
+                    total_tx_count / payload["window_blocks"]
+                    if payload["window_blocks"]
+                    else 0.0
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# Single-chain classification runner
+# ============================================================
+
+
+def classify_chain_window(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+    *,
+    config: Optional[ClassificationConfig] = None,
+    save_output: bool = True,
+) -> pd.DataFrame:
+    config = config or ClassificationConfig()
+
+    tx_df, obs_df, code_df = load_chain_window_inputs(
+        app_config=app_config,
+        chain=chain,
+        window_blocks=window_blocks,
     )
 
-    classified_df["behavioral_group"] = classified_df["behavioral_group"].astype(str)
-    classified_df["classification_confidence"] = classified_df["classification_confidence"].astype(str)
+    status_df = build_address_status_table(
+        transactions_df=tx_df,
+        observations_df=obs_df,
+        address_code_df=code_df,
+        config=config,
+    )
 
-    return classified_df
+    if save_output:
+        _save_dataframe(
+            df=status_df,
+            path_without_suffix=address_status_table_path_base(
+                app_config=app_config,
+                chain=chain,
+                window_blocks=window_blocks,
+            ),
+            table_format=app_config.storage.table_format,
+        )
+
+    logger.info(
+        "[%s][window=%s] address_status rows=%s active=%s passive=%s present=%s",
+        chain.name,
+        window_blocks,
+        len(status_df),
+        int(status_df["is_active"].sum()) if "is_active" in status_df.columns else 0,
+        int(status_df["is_passive"].sum()) if "is_passive" in status_df.columns else 0,
+        int(status_df["is_present"].sum()) if "is_present" in status_df.columns else 0,
+    )
+
+    return status_df
 
 
-def classify_from_normalized_df(
-    normalized_df: pd.DataFrame,
+def load_address_status_table(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> pd.DataFrame:
+    return _load_table_as_dataframe(
+        path_without_suffix=address_status_table_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
+    )
+
+
+# ============================================================
+# Set builders
+# ============================================================
+
+
+def build_status_sets(status_df: pd.DataFrame) -> Dict[str, Set[str]]:
+    if status_df.empty:
+        return {"present": set(), "active": set(), "passive": set()}
+
+    required = {"address", "is_present", "is_active", "is_passive"}
+    missing = required - set(status_df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in status_df: {sorted(missing)}")
+
+    address_series = status_df["address"].astype(str).str.lower()
+
+    return {
+        "present": set(address_series[status_df["is_present"].fillna(False)]),
+        "active": set(address_series[status_df["is_active"].fillna(False)]),
+        "passive": set(address_series[status_df["is_passive"].fillna(False)]),
+    }
+
+
+def build_presence_matrix(
+    status_tables_by_chain: Dict[str, pd.DataFrame],
     *,
-    normalization_config: Optional[NormalizationConfig] = None,
-    classification_config: Optional[ClassificationConfig] = None,
+    status_column: str,
 ) -> pd.DataFrame:
     """
-    Convenience wrapper:
-    normalized chain-level table -> address-level summary -> classified address table
+    Builds an address-by-chain boolean matrix for one status type:
+    is_present / is_active / is_passive
     """
-    summary_df = build_cross_chain_address_summary(
-        normalized_df,
-        config=normalization_config or NormalizationConfig(),
-    )
-    return classify_address_summary(
-        summary_df,
-        config=classification_config or ClassificationConfig(),
-    )
+    frames: List[pd.DataFrame] = []
+
+    for chain_name, df in status_tables_by_chain.items():
+        if df.empty:
+            continue
+        if "address" not in df.columns or status_column not in df.columns:
+            raise ValueError(
+                f"Chain={chain_name}: missing columns 'address' and/or {status_column!r}"
+            )
+
+        tmp = df[["address", status_column]].copy()
+        tmp["address"] = tmp["address"].astype(str).str.lower()
+        tmp = tmp.rename(columns={status_column: chain_name})
+        tmp[chain_name] = tmp[chain_name].fillna(False).astype(bool)
+        frames.append(tmp)
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.merge(frame, on="address", how="outer")
+
+    chain_columns = [col for col in out.columns if col != "address"]
+    out[chain_columns] = out[chain_columns].fillna(False).astype(bool)
+    out = out.sort_values("address").reset_index(drop=True)
+    return out
 
 
-def behavioral_group_counts(classified_df: pd.DataFrame) -> pd.DataFrame:
-    if "behavioral_group" not in classified_df.columns:
-        raise ValueError("Column 'behavioral_group' not found")
+def compute_pairwise_overlap_table(
+    presence_df: pd.DataFrame,
+    *,
+    status_name: str,
+) -> pd.DataFrame:
+    """
+    Pairwise set metrics for a boolean address-by-chain matrix.
+    """
+    if presence_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "status_name",
+                "source_chain",
+                "target_chain",
+                "source_size",
+                "target_size",
+                "intersection_size",
+                "union_size",
+                "jaccard",
+                "overlap_of_source",
+                "overlap_of_target",
+            ]
+        )
 
-    counts = (
-        classified_df["behavioral_group"]
-        .value_counts(dropna=False)
-        .rename_axis("behavioral_group")
-        .reset_index(name="count")
+    chains = [col for col in presence_df.columns if col != "address"]
+    rows: List[Dict[str, Any]] = []
+
+    for source_chain, target_chain in itertools.product(chains, chains):
+        source_mask = presence_df[source_chain].astype(bool)
+        target_mask = presence_df[target_chain].astype(bool)
+
+        source_size = int(source_mask.sum())
+        target_size = int(target_mask.sum())
+        intersection_size = int((source_mask & target_mask).sum())
+        union_size = int((source_mask | target_mask).sum())
+
+        rows.append(
+            {
+                "status_name": status_name,
+                "source_chain": source_chain,
+                "target_chain": target_chain,
+                "source_size": source_size,
+                "target_size": target_size,
+                "intersection_size": intersection_size,
+                "union_size": union_size,
+                "jaccard": (intersection_size / union_size) if union_size > 0 else 0.0,
+                "overlap_of_source": (
+                    intersection_size / source_size if source_size > 0 else 0.0
+                ),
+                "overlap_of_target": (
+                    intersection_size / target_size if target_size > 0 else 0.0
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def compute_triple_overlap_table(
+    presence_df: pd.DataFrame,
+    *,
+    status_name: str,
+) -> pd.DataFrame:
+    if presence_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "status_name",
+                "chain_a",
+                "chain_b",
+                "chain_c",
+                "intersection_size",
+            ]
+        )
+
+    chains = [col for col in presence_df.columns if col != "address"]
+    if len(chains) < 3:
+        return pd.DataFrame(
+            columns=[
+                "status_name",
+                "chain_a",
+                "chain_b",
+                "chain_c",
+                "intersection_size",
+            ]
+        )
+
+    rows: List[Dict[str, Any]] = []
+    for chain_a, chain_b, chain_c in itertools.combinations(chains, 3):
+        mask = (
+            presence_df[chain_a].astype(bool)
+            & presence_df[chain_b].astype(bool)
+            & presence_df[chain_c].astype(bool)
+        )
+        rows.append(
+            {
+                "status_name": status_name,
+                "chain_a": chain_a,
+                "chain_b": chain_b,
+                "chain_c": chain_c,
+                "intersection_size": int(mask.sum()),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def compute_mixed_overlap_table(
+    status_tables_by_chain: Dict[str, pd.DataFrame],
+    *,
+    left_status_column: str = "is_active",
+    right_status_column: str = "is_passive",
+    left_status_name: str = "active",
+    right_status_name: str = "passive",
+) -> pd.DataFrame:
+    """
+    Mixed intersections like:
+    active on Chain A ∩ passive on Chain B
+    """
+    sets_by_chain: Dict[str, Tuple[Set[str], Set[str]]] = {}
+
+    for chain_name, df in status_tables_by_chain.items():
+        if df.empty:
+            sets_by_chain[chain_name] = (set(), set())
+            continue
+
+        required = {"address", left_status_column, right_status_column}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"Chain={chain_name}: missing required columns {sorted(missing)}"
+            )
+
+        address_series = df["address"].astype(str).str.lower()
+        left_set = set(address_series[df[left_status_column].fillna(False)])
+        right_set = set(address_series[df[right_status_column].fillna(False)])
+        sets_by_chain[chain_name] = (left_set, right_set)
+
+    rows: List[Dict[str, Any]] = []
+    for source_chain, target_chain in itertools.product(sets_by_chain.keys(), repeat=2):
+        source_set, _ = sets_by_chain[source_chain]
+        _, target_set = sets_by_chain[target_chain]
+
+        intersection_size = len(source_set & target_set)
+        source_size = len(source_set)
+        target_size = len(target_set)
+        union_size = len(source_set | target_set)
+
+        rows.append(
+            {
+                "left_status_name": left_status_name,
+                "right_status_name": right_status_name,
+                "source_chain": source_chain,
+                "target_chain": target_chain,
+                "source_size": source_size,
+                "target_size": target_size,
+                "intersection_size": intersection_size,
+                "union_size": union_size,
+                "jaccard": intersection_size / union_size if union_size > 0 else 0.0,
+                "overlap_of_source": (
+                    intersection_size / source_size if source_size > 0 else 0.0
+                ),
+                "overlap_of_target": (
+                    intersection_size / target_size if target_size > 0 else 0.0
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# Cross-chain matching orchestration
+# ============================================================
+
+
+def run_cross_chain_matching_for_window(
+    app_config: AppConfig,
+    *,
+    window_blocks: int,
+    save_output: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Loads per-chain address status tables for one window and computes:
+    - present presence matrix
+    - active presence matrix
+    - passive presence matrix
+    - pairwise overlaps for all three
+    - triple overlaps for all three
+    - mixed active/passive overlaps
+    """
+    status_tables_by_chain: Dict[str, pd.DataFrame] = {}
+    for chain in app_config.enabled_chains:
+        status_tables_by_chain[chain.name] = load_address_status_table(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        )
+
+    present_presence = build_presence_matrix(
+        status_tables_by_chain=status_tables_by_chain,
+        status_column="is_present",
     )
-    counts["share"] = counts["count"] / counts["count"].sum()
-    return counts
+    active_presence = build_presence_matrix(
+        status_tables_by_chain=status_tables_by_chain,
+        status_column="is_active",
+    )
+    passive_presence = build_presence_matrix(
+        status_tables_by_chain=status_tables_by_chain,
+        status_column="is_passive",
+    )
+
+    present_pairwise = compute_pairwise_overlap_table(
+        present_presence,
+        status_name="present",
+    )
+    active_pairwise = compute_pairwise_overlap_table(
+        active_presence,
+        status_name="active",
+    )
+    passive_pairwise = compute_pairwise_overlap_table(
+        passive_presence,
+        status_name="passive",
+    )
+
+    present_triple = compute_triple_overlap_table(
+        present_presence,
+        status_name="present",
+    )
+    active_triple = compute_triple_overlap_table(
+        active_presence,
+        status_name="active",
+    )
+    passive_triple = compute_triple_overlap_table(
+        passive_presence,
+        status_name="passive",
+    )
+
+    mixed_active_passive = compute_mixed_overlap_table(
+        status_tables_by_chain=status_tables_by_chain,
+        left_status_column="is_active",
+        right_status_column="is_passive",
+        left_status_name="active",
+        right_status_name="passive",
+    )
+
+    outputs = {
+        "present_presence": present_presence,
+        "active_presence": active_presence,
+        "passive_presence": passive_presence,
+        "present_pairwise": present_pairwise,
+        "active_pairwise": active_pairwise,
+        "passive_pairwise": passive_pairwise,
+        "present_triple": present_triple,
+        "active_triple": active_triple,
+        "passive_triple": passive_triple,
+        "mixed_active_passive": mixed_active_passive,
+    }
+
+    if save_output:
+        _save_dataframe(
+            present_presence,
+            presence_matrix_path_base(app_config, window_blocks, "present"),
+            app_config.storage.table_format,
+        )
+        _save_dataframe(
+            active_presence,
+            presence_matrix_path_base(app_config, window_blocks, "active"),
+            app_config.storage.table_format,
+        )
+        _save_dataframe(
+            passive_presence,
+            presence_matrix_path_base(app_config, window_blocks, "passive"),
+            app_config.storage.table_format,
+        )
+
+        _save_dataframe(
+            present_pairwise,
+            pairwise_overlap_table_path_base(app_config, window_blocks, "present"),
+            app_config.storage.table_format,
+        )
+        _save_dataframe(
+            active_pairwise,
+            pairwise_overlap_table_path_base(app_config, window_blocks, "active"),
+            app_config.storage.table_format,
+        )
+        _save_dataframe(
+            passive_pairwise,
+            pairwise_overlap_table_path_base(app_config, window_blocks, "passive"),
+            app_config.storage.table_format,
+        )
+
+        _save_dataframe(
+            present_triple,
+            triple_overlap_table_path_base(app_config, window_blocks, "present"),
+            app_config.storage.table_format,
+        )
+        _save_dataframe(
+            active_triple,
+            triple_overlap_table_path_base(app_config, window_blocks, "active"),
+            app_config.storage.table_format,
+        )
+        _save_dataframe(
+            passive_triple,
+            triple_overlap_table_path_base(app_config, window_blocks, "passive"),
+            app_config.storage.table_format,
+        )
+
+        _save_dataframe(
+            mixed_active_passive,
+            pairwise_overlap_table_path_base(
+                app_config,
+                window_blocks,
+                "mixed_active_passive",
+            ),
+            app_config.storage.table_format,
+        )
+
+    return outputs
+
+
+# ============================================================
+# Full-layer orchestration
+# ============================================================
+
+
+def run_classification_for_all_chains_and_windows(
+    app_config: AppConfig,
+    *,
+    config: Optional[ClassificationConfig] = None,
+    save_output: bool = True,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Runs:
+    1. per-chain address classification
+    2. cross-chain matching
+    for all enabled chains and all configured block windows.
+
+    Returns:
+    {
+        1: {
+            "status_tables": {"ethereum": df, ...},
+            "matching": {...},
+        },
+        10: {...},
+        100: {...},
+    }
+    """
+    config = config or ClassificationConfig()
+    results: Dict[int, Dict[str, Any]] = {}
+
+    for window_blocks in app_config.sampling.windows.block_counts:
+        status_tables: Dict[str, pd.DataFrame] = {}
+
+        for chain in app_config.enabled_chains:
+            status_df = classify_chain_window(
+                app_config=app_config,
+                chain=chain,
+                window_blocks=window_blocks,
+                config=config,
+                save_output=save_output,
+            )
+            status_tables[chain.name] = status_df
+
+        matching = run_cross_chain_matching_for_window(
+            app_config=app_config,
+            window_blocks=window_blocks,
+            save_output=save_output,
+        )
+
+        results[window_blocks] = {
+            "status_tables": status_tables,
+            "matching": matching,
+        }
+
+    return results

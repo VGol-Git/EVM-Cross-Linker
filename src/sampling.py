@@ -1,40 +1,137 @@
-# Sampling module for wallet data
+# sampling.py
+# Block-window ingestion module for EVM cross-chain wallet correlation project.
+#
+# New responsibilities:
+# - exact last-N-block window planning
+# - raw block fetching with cache
+# - raw transaction extraction from full block payloads
+# - unique address collection from both `from` and `to`
+# - EOA lookup / caching via eth_getCode
+# - enrichment of transactions with sender/receiver EOA flags
 
 from __future__ import annotations
 
 import csv
 import json
 import logging
-import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from .api_client import EtherscanClient
+try:
+    import pandas as pd  # optional, only for parquet support
+except ImportError:  # pragma: no cover
+    pd = None
+
+from .api_client import AddressCodeResult, BlockchainClient
 from .config import AppConfig, ChainConfig
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SampledAddressRecord:
+JsonDict = Dict[str, Any]
+
+
+# ============================================================
+# Data classes
+# ============================================================
+
+
+@dataclass(frozen=True)
+class BlockWindowPlan:
     chain: str
-    address: str
-    source_block_number: int
-    block_timestamp: Optional[int]
-    tx_hash: str
-    tx_from: str
-    tx_to: Optional[str]
+    chain_id: int
+    reference_block_tag: str
+    reference_block_number: int
+    window_blocks: int
+    start_block: int
+    end_block: int
+    block_numbers: List[int]
+    created_at: str
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class RawTransactionRecord:
+    chain: str
+    chain_id: int
+    window_blocks: int
+    reference_block_number: int
+
+    block_number: int
+    block_timestamp: Optional[int]
+    tx_hash: str
+    tx_index: Optional[int]
+
+    from_address: str
+    to_address: Optional[str]
+
+    value_wei: int
+    nonce: int
+    gas: Optional[int]
+    gas_price_wei: Optional[int]
+
+    is_contract_creation: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AddressObservationRecord:
+    chain: str
+    chain_id: int
+    window_blocks: int
+    reference_block_number: int
+    address: str
+    seen_as_from: bool
+    seen_as_to: bool
+    tx_count_as_from: int
+    tx_count_as_to: int
+    first_seen_block: int
+    last_seen_block: int
+    first_seen_timestamp: Optional[int]
+    last_seen_timestamp: Optional[int]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AddressCodeCacheRecord:
+    chain: str
+    chain_id: int
+    address: str
+    code: str
+    is_eoa: bool
+    checked_at: str
+    block_tag: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ============================================================
+# Basic IO helpers
+# ============================================================
+
+
+def utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
@@ -44,10 +141,24 @@ def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
 def write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     rows = list(rows)
     if not rows:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            # write an empty file; schema cannot be inferred
+            f.write("")
         return
 
     fieldnames: List[str] = []
@@ -56,23 +167,80 @@ def write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
             if key not in fieldnames:
                 fieldnames.append(key)
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def read_csv(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        return [dict(row) for row in reader]
 
 
-def utc_now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
+def write_table(
+    rows: Sequence[Dict[str, Any]],
+    path_without_suffix: Path,
+    table_format: str,
+) -> Path:
+    """
+    Save a row-oriented table as parquet or csv depending on config.
+    """
+    table_format = table_format.strip().lower()
+    if table_format == "parquet":
+        if pd is None:
+            raise RuntimeError(
+                "table_format='parquet' requested but pandas is not installed."
+            )
+        path = path_without_suffix.with_suffix(".parquet")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(list(rows))
+        df.to_parquet(path, index=False)
+        return path
+
+    if table_format == "csv":
+        path = path_without_suffix.with_suffix(".csv")
+        write_csv(path, rows)
+        return path
+
+    raise ValueError(
+        f"Unsupported table_format={table_format!r}. Expected 'parquet' or 'csv'."
+    )
 
 
-def sanitize_address(address: str | None) -> Optional[str]:
-    if not address:
+def read_table(path_without_suffix: Path, table_format: str) -> List[Dict[str, Any]]:
+    table_format = table_format.strip().lower()
+    if table_format == "parquet":
+        path = path_without_suffix.with_suffix(".parquet")
+        if not path.exists():
+            return []
+        if pd is None:
+            raise RuntimeError(
+                "table_format='parquet' requested but pandas is not installed."
+            )
+        df = pd.read_parquet(path)
+        return df.to_dict(orient="records")
+
+    if table_format == "csv":
+        path = path_without_suffix.with_suffix(".csv")
+        return read_csv(path)
+
+    raise ValueError(
+        f"Unsupported table_format={table_format!r}. Expected 'parquet' or 'csv'."
+    )
+
+
+# ============================================================
+# Normalization helpers
+# ============================================================
+
+
+def sanitize_address(address: Optional[str]) -> Optional[str]:
+    if not address or not isinstance(address, str):
         return None
     address = address.strip().lower()
     if not address.startswith("0x"):
@@ -82,326 +250,867 @@ def sanitize_address(address: str | None) -> Optional[str]:
     return address
 
 
-def hex_to_int(value: str | None) -> Optional[int]:
+def hex_to_int(value: Any) -> Optional[int]:
     if value is None:
         return None
-    if isinstance(value, str) and value.startswith("0x"):
-        return int(value, 16)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        if value.startswith("0x"):
+            return int(value, 16)
+        return int(value)
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
 
 
-def estimate_start_block(
-    latest_block: int,
-    latest_block_ts: int,
-    observation_window_days: int,
-    approx_block_time_seconds: int,
-) -> int:
-    seconds = observation_window_days * 24 * 60 * 60
-    approx_blocks_back = math.ceil(seconds / approx_block_time_seconds)
-    return max(0, latest_block - approx_blocks_back)
+def _safe_int(value: Optional[int], default: int = 0) -> int:
+    return value if value is not None else default
 
 
-def evenly_spaced_block_numbers(
-    start_block: int,
-    end_block: int,
-    n_blocks: int,
-) -> List[int]:
-    if n_blocks <= 0:
-        raise ValueError("n_blocks must be > 0")
-    if start_block > end_block:
-        raise ValueError("start_block must be <= end_block")
-
-    if n_blocks == 1:
-        return [end_block]
-
-    span = end_block - start_block
-    if span == 0:
-        return [start_block]
-
-    block_numbers: List[int] = []
-    for i in range(n_blocks):
-        ratio = i / (n_blocks - 1)
-        block_num = start_block + round(span * ratio)
-        block_numbers.append(block_num)
-
-    # preserve order + deduplicate
-    seen: Set[int] = set()
-    out: List[int] = []
-    for b in block_numbers:
-        if b not in seen:
-            out.append(b)
-            seen.add(b)
-    return out
+# ============================================================
+# Path helpers
+# ============================================================
 
 
-def extract_from_addresses_from_block(
+def block_payload_path(
+    app_config: AppConfig,
     chain: ChainConfig,
-    block_payload: Dict[str, Any],
-) -> List[SampledAddressRecord]:
-    block_number = hex_to_int(block_payload.get("number")) or 0
-    block_ts = hex_to_int(block_payload.get("timestamp"))
-    txs = block_payload.get("transactions", []) or []
+    window_blocks: int,
+    block_number: int,
+) -> Path:
+    return (
+        app_config.paths.raw_blocks_dir
+        / chain.name
+        / f"window_{window_blocks}"
+        / f"block_{block_number}.json"
+    )
 
-    records: List[SampledAddressRecord] = []
+
+def transaction_table_path_base(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Path:
+    return (
+        app_config.paths.raw_transactions_dir
+        / chain.name
+        / f"{chain.name}_window_{window_blocks}_transactions"
+    )
+
+
+def address_observation_table_path_base(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Path:
+    return (
+        app_config.paths.interim_status_dir
+        / chain.name
+        / f"{chain.name}_window_{window_blocks}_address_observations"
+    )
+
+
+def address_code_cache_path_base(
+    app_config: AppConfig,
+    chain: ChainConfig,
+) -> Path:
+    return (
+        app_config.paths.raw_address_code_dir
+        / chain.name
+        / f"{chain.name}_address_code_cache"
+    )
+
+
+def address_code_snapshot_path_base(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Path:
+    return (
+        app_config.paths.interim_status_dir
+        / chain.name
+        / f"{chain.name}_window_{window_blocks}_address_code_snapshot"
+    )
+
+
+def enriched_transaction_table_path_base(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Path:
+    return (
+        app_config.paths.interim_status_dir
+        / chain.name
+        / f"{chain.name}_window_{window_blocks}_transactions_enriched"
+    )
+
+
+def manifest_path(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Path:
+    return (
+        app_config.paths.interim_status_dir
+        / chain.name
+        / f"{chain.name}_window_{window_blocks}_manifest.json"
+    )
+
+
+# ============================================================
+# Window planning
+# ============================================================
+
+
+def build_exact_block_window(
+    reference_block_number: int,
+    window_blocks: int,
+) -> List[int]:
+    if window_blocks <= 0:
+        raise ValueError(f"window_blocks must be > 0, got {window_blocks}")
+    if reference_block_number < 0:
+        raise ValueError(
+            f"reference_block_number must be >= 0, got {reference_block_number}"
+        )
+
+    start_block = max(0, reference_block_number - window_blocks + 1)
+    return list(range(start_block, reference_block_number + 1))
+
+
+def build_block_window_plan(
+    client: BlockchainClient,
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> BlockWindowPlan:
+    reference_block_number = client.get_reference_block_number(
+        chain=chain,
+        block_tag=app_config.sampling.reference_block_tag,
+    )
+    block_numbers = build_exact_block_window(
+        reference_block_number=reference_block_number,
+        window_blocks=window_blocks,
+    )
+
+    return BlockWindowPlan(
+        chain=chain.name,
+        chain_id=chain.chain_id,
+        reference_block_tag=app_config.sampling.reference_block_tag,
+        reference_block_number=reference_block_number,
+        window_blocks=window_blocks,
+        start_block=block_numbers[0],
+        end_block=block_numbers[-1],
+        block_numbers=block_numbers,
+        created_at=utc_now_iso(),
+    )
+
+
+# ============================================================
+# Block ingestion
+# ============================================================
+
+
+def load_or_fetch_block_payload(
+    client: BlockchainClient,
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+    block_number: int,
+) -> JsonDict:
+    cache_path = block_payload_path(
+        app_config=app_config,
+        chain=chain,
+        window_blocks=window_blocks,
+        block_number=block_number,
+    )
+
+    if app_config.storage.resume_from_cache and cache_path.exists():
+        logger.info("[%s][window=%s] Loading cached block %s", chain.name, window_blocks, block_number)
+        return read_json(cache_path)
+
+    logger.info("[%s][window=%s] Fetching block %s", chain.name, window_blocks, block_number)
+    payload = client.get_block_by_number(
+        chain=chain,
+        block_number=block_number,
+        full_transactions=app_config.sampling.full_transactions,
+    )
+
+    if app_config.storage.save_raw_block_payloads:
+        write_json(cache_path, payload)
+
+    return payload
+
+
+def fetch_blocks_for_window(
+    client: BlockchainClient,
+    app_config: AppConfig,
+    chain: ChainConfig,
+    plan: BlockWindowPlan,
+) -> List[JsonDict]:
+    payloads: List[JsonDict] = []
+    for block_number in plan.block_numbers:
+        payload = load_or_fetch_block_payload(
+            client=client,
+            app_config=app_config,
+            chain=chain,
+            window_blocks=plan.window_blocks,
+            block_number=block_number,
+        )
+        payloads.append(payload)
+    return payloads
+
+
+# ============================================================
+# Transaction extraction
+# ============================================================
+
+
+def extract_transactions_from_block_payload(
+    chain: ChainConfig,
+    window_blocks: int,
+    reference_block_number: int,
+    block_payload: JsonDict,
+) -> List[RawTransactionRecord]:
+    block_number = _safe_int(hex_to_int(block_payload.get("number")), default=0)
+    block_timestamp = hex_to_int(block_payload.get("timestamp"))
+
+    txs = block_payload.get("transactions", []) or []
+    rows: List[RawTransactionRecord] = []
 
     for tx in txs:
-        tx_from = sanitize_address(tx.get("from"))
-        tx_to = sanitize_address(tx.get("to"))
-        tx_hash = tx.get("hash") or ""
-
-        if tx_from is None:
+        from_address = sanitize_address(tx.get("from"))
+        if from_address is None:
+            # malformed tx payload; skip
             continue
 
-        records.append(
-            SampledAddressRecord(
+        to_address = sanitize_address(tx.get("to"))
+        tx_hash = str(tx.get("hash") or "").strip()
+        tx_index = hex_to_int(tx.get("transactionIndex"))
+        value_wei = _safe_int(hex_to_int(tx.get("value")), default=0)
+        nonce = _safe_int(hex_to_int(tx.get("nonce")), default=0)
+        gas = hex_to_int(tx.get("gas"))
+        gas_price_wei = hex_to_int(tx.get("gasPrice"))
+
+        rows.append(
+            RawTransactionRecord(
                 chain=chain.name,
-                address=tx_from,
-                source_block_number=block_number,
-                block_timestamp=block_ts,
+                chain_id=chain.chain_id,
+                window_blocks=window_blocks,
+                reference_block_number=reference_block_number,
+                block_number=block_number,
+                block_timestamp=block_timestamp,
                 tx_hash=tx_hash,
-                tx_from=tx_from,
-                tx_to=tx_to,
+                tx_index=tx_index,
+                from_address=from_address,
+                to_address=to_address,
+                value_wei=value_wei,
+                nonce=nonce,
+                gas=gas,
+                gas_price_wei=gas_price_wei,
+                is_contract_creation=(to_address is None),
             )
         )
 
-    return records
+    return rows
 
 
-def sample_addresses_from_blocks(
-    client: EtherscanClient,
-    app_config: AppConfig,
+def extract_transactions_from_blocks(
     chain: ChainConfig,
-    block_numbers: Sequence[int],
-    *,
-    max_seed_addresses: Optional[int] = None,
-) -> List[SampledAddressRecord]:
-    raw_dir = app_config.paths.raw_dir / "block_samples" / chain.name
-    interim_dir = app_config.paths.interim_dir / "seed_addresses"
-    interim_dir.mkdir(parents=True, exist_ok=True)
-
-    all_records: List[SampledAddressRecord] = []
-    seen_addresses: Set[str] = set()
-
-    for block_number in block_numbers:
-        block_path = raw_dir / f"block_{block_number}.json"
-
-        if app_config.sampling.resume_from_cache and block_path.exists():
-            logger.info("[%s] Loading cached block %s", chain.name, block_number)
-            block_payload = read_json(block_path)
-        else:
-            logger.info("[%s] Fetching block %s", chain.name, block_number)
-            block_payload = client.get_block_by_number(
+    window_blocks: int,
+    reference_block_number: int,
+    block_payloads: Sequence[JsonDict],
+) -> List[RawTransactionRecord]:
+    rows: List[RawTransactionRecord] = []
+    for payload in block_payloads:
+        rows.extend(
+            extract_transactions_from_block_payload(
                 chain=chain,
-                block_number=block_number,
-                full_transactions=True,
+                window_blocks=window_blocks,
+                reference_block_number=reference_block_number,
+                block_payload=payload,
             )
-            if app_config.sampling.save_raw_block_payloads:
-                write_json(block_path, block_payload)
-
-        block_records = extract_from_addresses_from_block(chain, block_payload)
-
-        for record in block_records:
-            if record.address in seen_addresses:
-                continue
-            all_records.append(record)
-            seen_addresses.add(record.address)
-
-            if max_seed_addresses and len(all_records) >= max_seed_addresses:
-                logger.info(
-                    "[%s] Reached max_seed_addresses=%s",
-                    chain.name,
-                    max_seed_addresses,
-                )
-                break
-
-        checkpoint_path = interim_dir / f"{chain.name}_sampled_addresses.csv"
-        write_csv(checkpoint_path, [r.to_dict() for r in all_records])
-
-        if max_seed_addresses and len(all_records) >= max_seed_addresses:
-            break
-
-    logger.info("[%s] Sampled %s unique seed addresses", chain.name, len(all_records))
-    return all_records
+        )
+    return rows
 
 
-def filter_eoa_addresses(
-    client: EtherscanClient,
+def save_raw_transactions(
     app_config: AppConfig,
     chain: ChainConfig,
-    sampled_records: Sequence[SampledAddressRecord],
-    *,
-    max_addresses: Optional[int] = None,
-) -> List[SampledAddressRecord]:
-    raw_dir = app_config.paths.raw_dir / "address_code" / chain.name
-    interim_dir = app_config.paths.interim_dir / "eoa_filtered"
-    interim_dir.mkdir(parents=True, exist_ok=True)
-
-    output_records: List[SampledAddressRecord] = []
-    inspected = 0
-
-    for record in sampled_records:
-        if max_addresses and inspected >= max_addresses:
-            logger.info(
-                "[%s] Reached max_addresses=%s during EOA filtering",
-                chain.name,
-                max_addresses,
-            )
-            break
-
-        address = record.address
-        cache_path = raw_dir / f"{address}.json"
-
-        if app_config.sampling.resume_from_cache and cache_path.exists():
-            payload = read_json(cache_path)
-            code = payload["result"]
-        else:
-            code = client.get_code(chain=chain, address=address)
-            payload = {
-                "address": address,
-                "chain": chain.name,
-                "chain_id": chain.chain_id,
-                "result": code,
-                "fetched_at": utc_now_iso(),
-            }
-            write_json(cache_path, payload)
-
-        if isinstance(code, str) and code.lower() in {"0x", "0x0"}:
-            output_records.append(record)
-
-        inspected += 1
-
-        if app_config.sampling.save_checkpoints and inspected % 50 == 0:
-            checkpoint_path = interim_dir / f"{chain.name}_eoa_addresses.csv"
-            write_csv(checkpoint_path, [r.to_dict() for r in output_records])
-
-    final_path = interim_dir / f"{chain.name}_eoa_addresses.csv"
-    write_csv(final_path, [r.to_dict() for r in output_records])
-
-    logger.info(
-        "[%s] EOA filter completed: %s EOAs out of %s inspected",
-        chain.name,
-        len(output_records),
-        inspected,
+    window_blocks: int,
+    transactions: Sequence[RawTransactionRecord],
+) -> Path:
+    rows = [tx.to_dict() for tx in transactions]
+    path = write_table(
+        rows=rows,
+        path_without_suffix=transaction_table_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
     )
-    return output_records
+    return path
 
 
-def build_sampling_manifest(
+def load_raw_transactions(
     app_config: AppConfig,
     chain: ChainConfig,
-    latest_block: int,
-    latest_block_ts: int,
-    start_block: int,
-    end_block: int,
-    sampled_blocks: Sequence[int],
+    window_blocks: int,
+) -> List[Dict[str, Any]]:
+    return read_table(
+        path_without_suffix=transaction_table_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
+    )
+
+
+# ============================================================
+# Address observation / aggregation
+# ============================================================
+
+
+def build_address_observations(
+    chain: ChainConfig,
+    window_blocks: int,
+    reference_block_number: int,
+    transactions: Sequence[RawTransactionRecord],
+) -> List[AddressObservationRecord]:
+    """
+    Build one row per address within a chain/window.
+    Tracks whether the address appears as sender and/or receiver.
+    """
+    state: Dict[str, Dict[str, Any]] = {}
+
+    def ensure(address: str) -> Dict[str, Any]:
+        if address not in state:
+            state[address] = {
+                "seen_as_from": False,
+                "seen_as_to": False,
+                "tx_count_as_from": 0,
+                "tx_count_as_to": 0,
+                "first_seen_block": None,
+                "last_seen_block": None,
+                "first_seen_timestamp": None,
+                "last_seen_timestamp": None,
+            }
+        return state[address]
+
+    for tx in transactions:
+        sender = tx.from_address
+        receiver = tx.to_address
+
+        sender_state = ensure(sender)
+        sender_state["seen_as_from"] = True
+        sender_state["tx_count_as_from"] += 1
+        _update_first_last_seen(
+            sender_state,
+            tx.block_number,
+            tx.block_timestamp,
+        )
+
+        if receiver:
+            receiver_state = ensure(receiver)
+            receiver_state["seen_as_to"] = True
+            receiver_state["tx_count_as_to"] += 1
+            _update_first_last_seen(
+                receiver_state,
+                tx.block_number,
+                tx.block_timestamp,
+            )
+
+    out: List[AddressObservationRecord] = []
+    for address, payload in sorted(state.items()):
+        out.append(
+            AddressObservationRecord(
+                chain=chain.name,
+                chain_id=chain.chain_id,
+                window_blocks=window_blocks,
+                reference_block_number=reference_block_number,
+                address=address,
+                seen_as_from=bool(payload["seen_as_from"]),
+                seen_as_to=bool(payload["seen_as_to"]),
+                tx_count_as_from=int(payload["tx_count_as_from"]),
+                tx_count_as_to=int(payload["tx_count_as_to"]),
+                first_seen_block=int(payload["first_seen_block"]),
+                last_seen_block=int(payload["last_seen_block"]),
+                first_seen_timestamp=payload["first_seen_timestamp"],
+                last_seen_timestamp=payload["last_seen_timestamp"],
+            )
+        )
+
+    return out
+
+
+def _update_first_last_seen(
+    state_row: Dict[str, Any],
+    block_number: int,
+    block_timestamp: Optional[int],
+) -> None:
+    current_first_block = state_row["first_seen_block"]
+    current_last_block = state_row["last_seen_block"]
+
+    if current_first_block is None or block_number < current_first_block:
+        state_row["first_seen_block"] = block_number
+        state_row["first_seen_timestamp"] = block_timestamp
+
+    if current_last_block is None or block_number > current_last_block:
+        state_row["last_seen_block"] = block_number
+        state_row["last_seen_timestamp"] = block_timestamp
+
+
+def save_address_observations(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+    observations: Sequence[AddressObservationRecord],
+) -> Path:
+    rows = [item.to_dict() for item in observations]
+    return write_table(
+        rows=rows,
+        path_without_suffix=address_observation_table_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
+    )
+
+
+def collect_unique_addresses_from_transactions(
+    transactions: Sequence[RawTransactionRecord],
+) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+
+    for tx in transactions:
+        for address in (tx.from_address, tx.to_address):
+            normalized = sanitize_address(address)
+            if normalized is None:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(normalized)
+
+    return out
+
+
+# ============================================================
+# Address code cache
+# ============================================================
+
+
+def load_address_code_cache(
+    app_config: AppConfig,
+    chain: ChainConfig,
+) -> Dict[str, AddressCodeCacheRecord]:
+    rows = read_table(
+        path_without_suffix=address_code_cache_path_base(app_config, chain),
+        table_format=app_config.storage.table_format,
+    )
+
+    cache: Dict[str, AddressCodeCacheRecord] = {}
+    for row in rows:
+        address = sanitize_address(row.get("address"))
+        if address is None:
+            continue
+
+        is_eoa_raw = row.get("is_eoa")
+        if isinstance(is_eoa_raw, str):
+            is_eoa = is_eoa_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            is_eoa = bool(is_eoa_raw)
+
+        cache[address] = AddressCodeCacheRecord(
+            chain=str(row.get("chain")),
+            chain_id=int(row.get("chain_id")),
+            address=address,
+            code=str(row.get("code") or ""),
+            is_eoa=is_eoa,
+            checked_at=str(row.get("checked_at") or ""),
+            block_tag=str(row.get("block_tag") or "latest"),
+        )
+
+    return cache
+
+
+def save_address_code_cache(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    cache_records: Sequence[AddressCodeCacheRecord],
+) -> Path:
+    rows = [item.to_dict() for item in cache_records]
+    return write_table(
+        rows=rows,
+        path_without_suffix=address_code_cache_path_base(app_config, chain),
+        table_format=app_config.storage.table_format,
+    )
+
+
+def resolve_address_codes_for_window(
+    client: BlockchainClient,
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+    addresses: Sequence[str],
+    block_tag: str = "latest",
+) -> Dict[str, AddressCodeCacheRecord]:
+    """
+    Resolve eth_getCode for all unique addresses in the current chain/window,
+    reusing chain-level cache so each address is checked once per chain.
+    """
+    chain_cache = load_address_code_cache(app_config=app_config, chain=chain)
+
+    unresolved: List[str] = []
+    for address in addresses:
+        normalized = sanitize_address(address)
+        if normalized is None:
+            continue
+        if normalized not in chain_cache:
+            unresolved.append(normalized)
+
+    if app_config.sampling.max_addresses_for_code_lookup is not None:
+        unresolved = unresolved[: app_config.sampling.max_addresses_for_code_lookup]
+
+    if unresolved:
+        logger.info(
+            "[%s][window=%s] Resolving eth_getCode for %s uncached addresses",
+            chain.name,
+            window_blocks,
+            len(unresolved),
+        )
+        batch_results: List[AddressCodeResult] = client.get_codes(
+            chain=chain,
+            addresses=unresolved,
+            block_tag=block_tag,
+        )
+
+        now = utc_now_iso()
+        for item in batch_results:
+            chain_cache[item.address] = AddressCodeCacheRecord(
+                chain=chain.name,
+                chain_id=chain.chain_id,
+                address=item.address,
+                code=item.code,
+                is_eoa=item.is_eoa,
+                checked_at=now,
+                block_tag=block_tag,
+            )
+
+        save_address_code_cache(
+            app_config=app_config,
+            chain=chain,
+            cache_records=list(chain_cache.values()),
+        )
+    else:
+        logger.info(
+            "[%s][window=%s] All %s addresses already present in code cache",
+            chain.name,
+            window_blocks,
+            len(addresses),
+        )
+
+    snapshot_records: List[AddressCodeCacheRecord] = [
+        chain_cache[address]
+        for address in addresses
+        if address in chain_cache
+    ]
+    write_table(
+        rows=[item.to_dict() for item in snapshot_records],
+        path_without_suffix=address_code_snapshot_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
+    )
+
+    return {record.address: record for record in snapshot_records}
+
+
+# ============================================================
+# Transaction enrichment
+# ============================================================
+
+
+def enrich_transactions_with_eoa_flags(
+    transactions: Sequence[RawTransactionRecord],
+    address_code_lookup: Dict[str, AddressCodeCacheRecord],
+) -> List[Dict[str, Any]]:
+    enriched_rows: List[Dict[str, Any]] = []
+
+    for tx in transactions:
+        sender_meta = address_code_lookup.get(tx.from_address)
+        receiver_meta = address_code_lookup.get(tx.to_address) if tx.to_address else None
+
+        row = tx.to_dict()
+        row["from_is_eoa"] = sender_meta.is_eoa if sender_meta is not None else None
+        row["to_is_eoa"] = receiver_meta.is_eoa if receiver_meta is not None else None
+        row["from_code"] = sender_meta.code if sender_meta is not None else None
+        row["to_code"] = receiver_meta.code if receiver_meta is not None else None
+        enriched_rows.append(row)
+
+    return enriched_rows
+
+
+def save_enriched_transactions(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+    enriched_rows: Sequence[Dict[str, Any]],
+) -> Path:
+    return write_table(
+        rows=list(enriched_rows),
+        path_without_suffix=enriched_transaction_table_path_base(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        table_format=app_config.storage.table_format,
+    )
+
+
+# ============================================================
+# Manifest / orchestration
+# ============================================================
+
+
+def build_window_manifest(
+    plan: BlockWindowPlan,
+    tx_count: int,
+    unique_address_count: int,
+    eoa_count: int,
+    contract_count: int,
 ) -> Dict[str, Any]:
     return {
         "created_at": utc_now_iso(),
-        "chain": chain.name,
-        "chain_id": chain.chain_id,
-        "observation_window_days": app_config.sampling.observation_window_days,
-        "latest_block": latest_block,
-        "latest_block_timestamp": latest_block_ts,
-        "start_block_estimate": start_block,
-        "end_block": end_block,
-        "blocks_per_chain": app_config.sampling.blocks_per_chain,
-        "sampled_blocks": list(sampled_blocks),
+        "chain": plan.chain,
+        "chain_id": plan.chain_id,
+        "reference_block_tag": plan.reference_block_tag,
+        "reference_block_number": plan.reference_block_number,
+        "window_blocks": plan.window_blocks,
+        "start_block": plan.start_block,
+        "end_block": plan.end_block,
+        "block_numbers": plan.block_numbers,
+        "transaction_count": tx_count,
+        "unique_address_count": unique_address_count,
+        "eoa_count": eoa_count,
+        "contract_count": contract_count,
     }
 
 
-def plan_block_sample(
-    client: EtherscanClient,
+def run_block_window_ingestion_for_chain(
+    client: BlockchainClient,
     app_config: AppConfig,
     chain: ChainConfig,
-    *,
-    approx_block_time_seconds: int,
-) -> List[int]:
-    latest_block = client.get_latest_block_number(chain)
-    latest_block_payload = client.get_block_by_number(
-        chain=chain,
-        block_number=latest_block,
-        full_transactions=False,
-    )
+    window_blocks: int,
+) -> Dict[str, Any]:
+    """
+    Full stage runner for one chain and one exact block window.
 
-    latest_block_ts = hex_to_int(latest_block_payload.get("timestamp"))
-    if latest_block_ts is None:
-        raise RuntimeError(f"Could not resolve latest block timestamp for {chain.name}")
-
-    start_block = estimate_start_block(
-        latest_block=latest_block,
-        latest_block_ts=latest_block_ts,
-        observation_window_days=app_config.sampling.observation_window_days,
-        approx_block_time_seconds=approx_block_time_seconds,
-    )
-    end_block = latest_block
-
-    sampled_blocks = evenly_spaced_block_numbers(
-        start_block=start_block,
-        end_block=end_block,
-        n_blocks=app_config.sampling.blocks_per_chain,
-    )
-
-    manifest = build_sampling_manifest(
+    Returns a compact dictionary with the in-memory artifacts needed by next stages.
+    """
+    # 1) Plan exact block window
+    plan = build_block_window_plan(
+        client=client,
         app_config=app_config,
         chain=chain,
-        latest_block=latest_block,
-        latest_block_ts=latest_block_ts,
-        start_block=start_block,
-        end_block=end_block,
-        sampled_blocks=sampled_blocks,
+        window_blocks=window_blocks,
     )
-    manifest_path = app_config.paths.interim_dir / "sampling_manifests" / f"{chain.name}.json"
-    write_json(manifest_path, manifest)
+
+    # 2) Load cached transactions if available
+    cached_tx_rows: List[Dict[str, Any]] = []
+    if app_config.storage.resume_from_cache:
+        cached_tx_rows = load_raw_transactions(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        )
+
+    if cached_tx_rows:
+        logger.info(
+            "[%s][window=%s] Loaded %s cached transaction rows",
+            chain.name,
+            window_blocks,
+            len(cached_tx_rows),
+        )
+        transactions = [raw_transaction_record_from_dict(row) for row in cached_tx_rows]
+    else:
+        # 3) Fetch exact blocks
+        block_payloads = fetch_blocks_for_window(
+            client=client,
+            app_config=app_config,
+            chain=chain,
+            plan=plan,
+        )
+
+        # 4) Extract raw transaction rows
+        transactions = extract_transactions_from_blocks(
+            chain=chain,
+            window_blocks=window_blocks,
+            reference_block_number=plan.reference_block_number,
+            block_payloads=block_payloads,
+        )
+
+        if app_config.storage.save_raw_transaction_rows:
+            save_raw_transactions(
+                app_config=app_config,
+                chain=chain,
+                window_blocks=window_blocks,
+                transactions=transactions,
+            )
+
+    # 5) Address observations
+    observations = build_address_observations(
+        chain=chain,
+        window_blocks=window_blocks,
+        reference_block_number=plan.reference_block_number,
+        transactions=transactions,
+    )
+    save_address_observations(
+        app_config=app_config,
+        chain=chain,
+        window_blocks=window_blocks,
+        observations=observations,
+    )
+
+    # 6) Unique address set from both sender and receiver sides
+    unique_addresses = collect_unique_addresses_from_transactions(transactions)
+
+    # 7) Resolve/cached EOA status
+    address_code_lookup = resolve_address_codes_for_window(
+        client=client,
+        app_config=app_config,
+        chain=chain,
+        window_blocks=window_blocks,
+        addresses=unique_addresses,
+        block_tag="latest",
+    )
+
+    # 8) Enrich raw transactions with EOA flags
+    enriched_rows = enrich_transactions_with_eoa_flags(
+        transactions=transactions,
+        address_code_lookup=address_code_lookup,
+    )
+    save_enriched_transactions(
+        app_config=app_config,
+        chain=chain,
+        window_blocks=window_blocks,
+        enriched_rows=enriched_rows,
+    )
+
+    # 9) Save manifest
+    eoa_count = sum(1 for item in address_code_lookup.values() if item.is_eoa)
+    contract_count = sum(1 for item in address_code_lookup.values() if not item.is_eoa)
+
+    manifest = build_window_manifest(
+        plan=plan,
+        tx_count=len(transactions),
+        unique_address_count=len(unique_addresses),
+        eoa_count=eoa_count,
+        contract_count=contract_count,
+    )
+    write_json(
+        manifest_path(
+            app_config=app_config,
+            chain=chain,
+            window_blocks=window_blocks,
+        ),
+        manifest,
+    )
 
     logger.info(
-        "[%s] Planned %s sample blocks from %s to %s",
+        "[%s][window=%s] blocks=%s tx=%s unique_addresses=%s eoa=%s contracts=%s",
         chain.name,
-        len(sampled_blocks),
-        start_block,
-        end_block,
+        window_blocks,
+        len(plan.block_numbers),
+        len(transactions),
+        len(unique_addresses),
+        eoa_count,
+        contract_count,
     )
-    return sampled_blocks
+
+    return {
+        "plan": plan,
+        "transactions": transactions,
+        "observations": observations,
+        "address_code_lookup": address_code_lookup,
+        "enriched_transactions": enriched_rows,
+        "manifest": manifest,
+    }
 
 
-def run_seed_sampling_for_chain(
-    client: EtherscanClient,
+def run_block_window_ingestion_for_all_chains(
+    client: BlockchainClient,
     app_config: AppConfig,
-    chain: ChainConfig,
-    *,
-    approx_block_time_seconds: int,
-) -> List[SampledAddressRecord]:
-    sampled_blocks = plan_block_sample(
-        client=client,
-        app_config=app_config,
-        chain=chain,
-        approx_block_time_seconds=approx_block_time_seconds,
+) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    """
+    Run the ingestion stage for all enabled chains and all configured block windows.
+
+    Output shape:
+    {
+        "ethereum": {
+            1: {...},
+            10: {...},
+            100: {...},
+        },
+        "polygon": {...},
+        ...
+    }
+    """
+    out: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for chain in app_config.enabled_chains:
+        out[chain.name] = {}
+        for window_blocks in app_config.sampling.windows.block_counts:
+            out[chain.name][window_blocks] = run_block_window_ingestion_for_chain(
+                client=client,
+                app_config=app_config,
+                chain=chain,
+                window_blocks=window_blocks,
+            )
+    return out
+
+
+# ============================================================
+# Deserialization helpers
+# ============================================================
+
+
+def raw_transaction_record_from_dict(row: Dict[str, Any]) -> RawTransactionRecord:
+    return RawTransactionRecord(
+        chain=str(row["chain"]),
+        chain_id=int(row["chain_id"]),
+        window_blocks=int(row["window_blocks"]),
+        reference_block_number=int(row["reference_block_number"]),
+        block_number=int(row["block_number"]),
+        block_timestamp=(
+            int(row["block_timestamp"]) if row.get("block_timestamp") not in (None, "", "None") else None
+        ),
+        tx_hash=str(row["tx_hash"]),
+        tx_index=(
+            int(row["tx_index"]) if row.get("tx_index") not in (None, "", "None") else None
+        ),
+        from_address=str(row["from_address"]).lower(),
+        to_address=(
+            str(row["to_address"]).lower()
+            if row.get("to_address") not in (None, "", "None")
+            else None
+        ),
+        value_wei=int(row["value_wei"]),
+        nonce=int(row["nonce"]),
+        gas=int(row["gas"]) if row.get("gas") not in (None, "", "None") else None,
+        gas_price_wei=(
+            int(row["gas_price_wei"])
+            if row.get("gas_price_wei") not in (None, "", "None")
+            else None
+        ),
+        is_contract_creation=str(row["is_contract_creation"]).strip().lower() in {"1", "true", "yes"},
     )
-
-    sampled_records = sample_addresses_from_blocks(
-        client=client,
-        app_config=app_config,
-        chain=chain,
-        block_numbers=sampled_blocks,
-        max_seed_addresses=app_config.sampling.max_seed_addresses_per_chain,
-    )
-
-    eoa_records = filter_eoa_addresses(
-        client=client,
-        app_config=app_config,
-        chain=chain,
-        sampled_records=sampled_records,
-        max_addresses=app_config.sampling.max_eoa_filter_addresses,
-    )
-
-    return eoa_records
-
-
-def export_address_only_csv(
-    path: Path,
-    sampled_records: Sequence[SampledAddressRecord],
-) -> None:
-    rows = [{"address": r.address, "chain": r.chain} for r in sampled_records]
-    write_csv(path, rows)
