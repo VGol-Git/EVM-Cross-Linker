@@ -6,12 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
-
-import pandas as pd
+from typing import Any, Dict, List, Optional, Sequence
 
 from .api_client import BlockchainClient
 from .classify import (
@@ -22,19 +20,11 @@ from .config import AppConfig, load_config
 from .features import build_features_for_all_windows
 from .plots import (
     PlotConfig,
-    build_chain_status_count_table,
-    plot_chain_status_counts,
-    plot_first_activity_delta_histogram,
-    plot_pairwise_correlation_heatmap,
-    plot_pairwise_intersection_heatmap,
-    plot_pairwise_jaccard_heatmap,
-    plot_summary_table,
-    plot_value_sent_scatter,
-    save_figure,
+    render_plots_for_window,
+    run_plot_stage_from_disk,
 )
 from .sampling import run_block_window_ingestion_for_all_chains
 from .stats import StatsConfig, run_statistics_for_all_windows
-
 
 logger = logging.getLogger(__name__)
 
@@ -190,245 +180,12 @@ def pipeline_manifest_path(app_config: AppConfig, run_id: str) -> Path:
     return app_config.paths.logs_dir / f"pipeline_run_{run_id}.json"
 
 
-def stage_output_dir(
-    app_config: AppConfig,
-    stage_name: str,
-    window_blocks: Optional[int] = None,
-) -> Path:
-    base = ensure_dir(app_config.paths.outputs_dir / "pipeline")
-    if window_blocks is None:
-        return ensure_dir(base / stage_name)
-    return ensure_dir(base / stage_name / f"window_{window_blocks}")
-
-
 # ============================================================
-# Plot helpers
+# Plot stage runners
 # ============================================================
 
 
-def _filter_feature_stats_for_metric(
-    feature_stats_df: pd.DataFrame,
-    *,
-    feature_name: str,
-    metric_col: str,
-) -> pd.DataFrame:
-    if feature_stats_df.empty:
-        return pd.DataFrame()
-
-    required = {"chain_a", "chain_b", "feature_a", "feature_b", metric_col}
-    missing = required - set(feature_stats_df.columns)
-    if missing:
-        raise ValueError(
-            f"feature_stats_df missing required columns: {sorted(missing)}"
-        )
-
-    df = feature_stats_df.copy()
-    df = df[
-        (df["feature_a"].astype(str) == feature_name)
-        & (df["feature_b"].astype(str) == feature_name)
-    ].copy()
-
-    if df.empty:
-        return df
-
-    df[metric_col] = pd.to_numeric(df[metric_col], errors="coerce")
-    return df
-
-
-def run_plots_for_window(
-    app_config: AppConfig,
-    *,
-    window_blocks: int,
-    classification_outputs_for_window: Dict[str, Any],
-    feature_outputs_for_window: Dict[str, Any],
-    stats_outputs_for_window: Dict[str, Any],
-    plot_config: Optional[PlotConfig] = None,
-) -> Dict[str, str]:
-    plot_config = plot_config or PlotConfig()
-    saved_paths: Dict[str, str] = {}
-
-    output_dir = stage_output_dir(
-        app_config=app_config,
-        stage_name=STAGE_PLOTS,
-        window_blocks=window_blocks,
-    )
-
-    # --------------------------------------------------------
-    # 1. Chain status counts
-    # --------------------------------------------------------
-    status_tables_by_chain = classification_outputs_for_window["status_tables"]
-    chain_counts_df = build_chain_status_count_table(status_tables_by_chain)
-
-    fig, _ = plot_chain_status_counts(
-        chain_counts_df,
-        title=f"Wallet counts by chain (window={window_blocks} blocks)",
-        config=plot_config,
-    )
-    path = save_figure(fig, output_dir / "chain_status_counts.png", plot_config)
-    saved_paths["chain_status_counts"] = str(path)
-
-    # --------------------------------------------------------
-    # 2. Overlap / Jaccard heatmaps
-    # --------------------------------------------------------
-    matching = classification_outputs_for_window["matching"]
-
-    pairwise_plot_specs = [
-        ("present_pairwise", "present_intersection_heatmap", "Present overlap count"),
-        ("active_pairwise", "active_intersection_heatmap", "Active overlap count"),
-        ("passive_pairwise", "passive_intersection_heatmap", "Passive overlap count"),
-    ]
-
-    for key, out_name, title in pairwise_plot_specs:
-        df = matching.get(key, pd.DataFrame())
-        if df is not None and not df.empty:
-            fig, _ = plot_pairwise_intersection_heatmap(
-                df,
-                title=f"{title} (window={window_blocks} blocks)",
-                config=plot_config,
-            )
-            path = save_figure(fig, output_dir / f"{out_name}.png", plot_config)
-            saved_paths[out_name] = str(path)
-
-    jaccard_plot_specs = [
-        ("present_pairwise", "present_jaccard_heatmap", "Present Jaccard similarity"),
-        ("active_pairwise", "active_jaccard_heatmap", "Active Jaccard similarity"),
-        ("passive_pairwise", "passive_jaccard_heatmap", "Passive Jaccard similarity"),
-        (
-            "mixed_active_passive",
-            "mixed_active_passive_jaccard_heatmap",
-            "Active vs Passive Jaccard similarity",
-        ),
-    ]
-
-    for key, out_name, title in jaccard_plot_specs:
-        df = matching.get(key, pd.DataFrame())
-        if df is not None and not df.empty:
-            fig, _ = plot_pairwise_jaccard_heatmap(
-                df,
-                title=f"{title} (window={window_blocks} blocks)",
-                config=plot_config,
-            )
-            path = save_figure(fig, output_dir / f"{out_name}.png", plot_config)
-            saved_paths[out_name] = str(path)
-
-    # --------------------------------------------------------
-    # 3. Feature-alignment plots per chain pair
-    # --------------------------------------------------------
-    pairwise_alignments = feature_outputs_for_window["pairwise_alignments"]
-
-    for (chain_a, chain_b), alignment_df in pairwise_alignments.items():
-        if alignment_df is None or alignment_df.empty:
-            continue
-
-        pair_prefix = f"{chain_a}_vs_{chain_b}"
-
-        try:
-            fig, _ = plot_value_sent_scatter(
-                alignment_df,
-                chain_a=chain_a,
-                chain_b=chain_b,
-                title=f"Sent value: {chain_a} vs {chain_b} ({window_blocks} blocks)",
-                config=plot_config,
-            )
-            path = save_figure(
-                fig,
-                output_dir / f"{pair_prefix}_value_sent_scatter.png",
-                plot_config,
-            )
-            saved_paths[f"{pair_prefix}_value_sent_scatter"] = str(path)
-        except ValueError as exc:
-            logger.warning(
-                "[window=%s] Skip value scatter for %s vs %s: %s",
-                window_blocks,
-                chain_a,
-                chain_b,
-                exc,
-            )
-
-        try:
-            fig, _ = plot_first_activity_delta_histogram(
-                alignment_df,
-                chain_a=chain_a,
-                chain_b=chain_b,
-                title=f"Δ first activity: {chain_a} vs {chain_b} ({window_blocks} blocks)",
-                config=plot_config,
-            )
-            path = save_figure(
-                fig,
-                output_dir / f"{pair_prefix}_first_activity_delta_hist.png",
-                plot_config,
-            )
-            saved_paths[f"{pair_prefix}_first_activity_delta_hist"] = str(path)
-        except ValueError as exc:
-            logger.warning(
-                "[window=%s] Skip first-activity histogram for %s vs %s: %s",
-                window_blocks,
-                chain_a,
-                chain_b,
-                exc,
-            )
-
-    # --------------------------------------------------------
-    # 4. Correlation heatmaps from stats layer
-    # --------------------------------------------------------
-    feature_stats_df = stats_outputs_for_window["features"].get(
-        "feature_stats",
-        pd.DataFrame(),
-    )
-
-    correlation_specs = [
-        ("value_sent_wei", "pearson_r", "value_sent_pearson_heatmap", "Pearson r: sent value"),
-        ("value_sent_wei", "spearman_r", "value_sent_spearman_heatmap", "Spearman r: sent value"),
-        ("tx_frequency_per_day", "pearson_r", "tx_frequency_pearson_heatmap", "Pearson r: tx/day"),
-        ("tx_frequency_per_day", "spearman_r", "tx_frequency_spearman_heatmap", "Spearman r: tx/day"),
-        ("unique_counterparties", "pearson_r", "counterparties_pearson_heatmap", "Pearson r: counterparties"),
-        ("unique_counterparties", "spearman_r", "counterparties_spearman_heatmap", "Spearman r: counterparties"),
-    ]
-
-    for feature_name, metric_col, out_name, title in correlation_specs:
-        df = _filter_feature_stats_for_metric(
-            feature_stats_df,
-            feature_name=feature_name,
-            metric_col=metric_col,
-        )
-        if df.empty:
-            continue
-
-        try:
-            fig, _ = plot_pairwise_correlation_heatmap(
-                df,
-                metric_col=metric_col,
-                title=f"{title} (window={window_blocks} blocks)",
-                config=plot_config,
-            )
-            path = save_figure(fig, output_dir / f"{out_name}.png", plot_config)
-            saved_paths[out_name] = str(path)
-        except ValueError as exc:
-            logger.warning(
-                "[window=%s] Skip correlation heatmap %s: %s",
-                window_blocks,
-                out_name,
-                exc,
-            )
-
-    # --------------------------------------------------------
-    # 5. Summary table plot
-    # --------------------------------------------------------
-    summary_df = stats_outputs_for_window.get("summary", pd.DataFrame())
-    if summary_df is not None and not summary_df.empty:
-        fig, _ = plot_summary_table(
-            summary_df,
-            title=f"Statistical summary (window={window_blocks} blocks)",
-            max_rows=20,
-            config=plot_config,
-        )
-        path = save_figure(fig, output_dir / "stats_summary_table.png", plot_config)
-        saved_paths["stats_summary_table"] = str(path)
-
-    return saved_paths
-
-
-def run_plot_stage(
+def run_plot_stage_memory(
     app_config: AppConfig,
     *,
     classification_outputs: Dict[int, Dict[str, Any]],
@@ -436,15 +193,19 @@ def run_plot_stage(
     stats_outputs: Dict[int, Dict[str, Any]],
     plot_config: Optional[PlotConfig] = None,
 ) -> Dict[int, Dict[str, str]]:
+    """
+    Render plots using in-memory outputs from classify/features/stats stages
+    executed in the same pipeline session.
+    """
     plot_config = plot_config or PlotConfig()
-
     outputs: Dict[int, Dict[str, str]] = {}
+
     for window_blocks in app_config.sampling.windows.block_counts:
         classification_for_window = classification_outputs.get(window_blocks, {})
         feature_for_window = feature_outputs.get(window_blocks, {})
         stats_for_window = stats_outputs.get(window_blocks, {})
 
-        outputs[window_blocks] = run_plots_for_window(
+        outputs[window_blocks] = render_plots_for_window(
             app_config=app_config,
             window_blocks=window_blocks,
             classification_outputs_for_window=classification_for_window,
@@ -624,31 +385,32 @@ def execute_pipeline(
         outputs["stats"] = stats_outputs
 
     if STAGE_PLOTS in requested_stages:
-        if not classification_outputs:
-            raise RuntimeError(
-                "Plot stage requires classification outputs. "
-                "Run classify stage in the same pipeline execution."
+        # Prefer in-memory outputs if all three are available in the same session.
+        if classification_outputs and feature_outputs and stats_outputs:
+            logger.info(
+                "Plot stage will use in-memory outputs from classify/features/stats."
             )
-        if not feature_outputs:
-            raise RuntimeError(
-                "Plot stage requires feature outputs. "
-                "Run features stage in the same pipeline execution."
+            plot_outputs = run_stage(
+                STAGE_PLOTS,
+                run_plot_stage_memory,
+                app_config,
+                classification_outputs=classification_outputs,
+                feature_outputs=feature_outputs,
+                stats_outputs=stats_outputs,
+                plot_config=plot_config,
             )
-        if not stats_outputs:
-            raise RuntimeError(
-                "Plot stage requires stats outputs. "
-                "Run stats stage in the same pipeline execution."
+        else:
+            # Fallback: load all plot inputs from disk.
+            logger.info(
+                "Plot stage is missing in-memory outputs; falling back to disk-backed plot loading."
+            )
+            plot_outputs = run_stage(
+                STAGE_PLOTS,
+                run_plot_stage_from_disk,
+                app_config,
+                plot_config=plot_config,
             )
 
-        plot_outputs = run_stage(
-            STAGE_PLOTS,
-            run_plot_stage,
-            app_config,
-            classification_outputs=classification_outputs,
-            feature_outputs=feature_outputs,
-            stats_outputs=stats_outputs,
-            plot_config=plot_config,
-        )
         outputs["plots"] = plot_outputs
 
     run_result.finished_at = utc_now_iso()

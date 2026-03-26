@@ -1,13 +1,19 @@
 # sampling.py
 # Block-window ingestion module for EVM cross-chain wallet correlation project.
 #
-# New responsibilities:
+# Responsibilities:
 # - exact last-N-block window planning
 # - raw block fetching with cache
 # - raw transaction extraction from full block payloads
 # - unique address collection from both `from` and `to`
 # - EOA lookup / caching via eth_getCode
 # - enrichment of transactions with sender/receiver EOA flags
+#
+# Important notes:
+# - observation windows are block-based, not day-based
+# - cached transaction reuse is validated against a manifest for the same exact window
+# - eth_getCode is resolved in chunks and persisted incrementally
+# - parquet writes are protected against uint256-like integer overflow
 
 from __future__ import annotations
 
@@ -16,8 +22,9 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from numbers import Integral
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 try:
     import pandas as pd  # optional, only for parquet support
@@ -31,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 
 JsonDict = Dict[str, Any]
+
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
 
 
 # ============================================================
@@ -157,7 +167,6 @@ def write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8", newline="") as f:
-            # write an empty file; schema cannot be inferred
             f.write("")
         return
 
@@ -182,6 +191,39 @@ def read_csv(path: Path) -> List[Dict[str, Any]]:
         return [dict(row) for row in reader]
 
 
+def _is_int64_compatible(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, Integral):
+        return INT64_MIN <= int(value) <= INT64_MAX
+    return True
+
+
+def _prepare_dataframe_for_parquet(df: "pd.DataFrame") -> "pd.DataFrame":
+    """
+    PyArrow parquet does not safely support arbitrary-size Python integers.
+    EVM numeric fields such as *_wei may exceed int64, so such columns are
+    converted to strings before writing.
+    """
+    out = df.copy()
+
+    for col in out.columns:
+        series = out[col]
+        has_big_int = False
+
+        for value in series.dropna():
+            if not _is_int64_compatible(value):
+                has_big_int = True
+                break
+
+        if has_big_int:
+            out[col] = out[col].map(
+                lambda x: str(x) if x is not None and not pd.isna(x) else None
+            )
+
+    return out
+
+
 def write_table(
     rows: Sequence[Dict[str, Any]],
     path_without_suffix: Path,
@@ -191,6 +233,7 @@ def write_table(
     Save a row-oriented table as parquet or csv depending on config.
     """
     table_format = table_format.strip().lower()
+
     if table_format == "parquet":
         if pd is None:
             raise RuntimeError(
@@ -198,8 +241,11 @@ def write_table(
             )
         path = path_without_suffix.with_suffix(".parquet")
         path.parent.mkdir(parents=True, exist_ok=True)
+
         df = pd.DataFrame(list(rows))
+        df = _prepare_dataframe_for_parquet(df)
         df.to_parquet(path, index=False)
+
         return path
 
     if table_format == "csv":
@@ -214,6 +260,7 @@ def write_table(
 
 def read_table(path_without_suffix: Path, table_format: str) -> List[Dict[str, Any]]:
     table_format = table_format.strip().lower()
+
     if table_format == "parquet":
         path = path_without_suffix.with_suffix(".parquet")
         if not path.exists():
@@ -363,6 +410,57 @@ def manifest_path(
 
 
 # ============================================================
+# Manifest helpers
+# ============================================================
+
+
+def load_window_manifest(
+    app_config: AppConfig,
+    chain: ChainConfig,
+    window_blocks: int,
+) -> Optional[Dict[str, Any]]:
+    path = manifest_path(app_config=app_config, chain=chain, window_blocks=window_blocks)
+    if not path.exists():
+        return None
+    try:
+        payload = read_json(path)
+    except Exception as exc:
+        logger.warning(
+            "[%s][window=%s] Failed to read manifest, ignoring cache: %s",
+            chain.name,
+            window_blocks,
+            exc,
+        )
+        return None
+
+    return payload if isinstance(payload, dict) else None
+
+
+def manifest_matches_plan(
+    manifest: Optional[Dict[str, Any]],
+    plan: BlockWindowPlan,
+) -> bool:
+    if manifest is None:
+        return False
+
+    try:
+        manifest_block_numbers = [int(x) for x in manifest.get("block_numbers", [])]
+    except Exception:
+        return False
+
+    return (
+        str(manifest.get("chain")) == plan.chain
+        and int(manifest.get("chain_id", -1)) == plan.chain_id
+        and str(manifest.get("reference_block_tag")) == plan.reference_block_tag
+        and int(manifest.get("reference_block_number", -1)) == plan.reference_block_number
+        and int(manifest.get("window_blocks", -1)) == plan.window_blocks
+        and int(manifest.get("start_block", -1)) == plan.start_block
+        and int(manifest.get("end_block", -1)) == plan.end_block
+        and manifest_block_numbers == plan.block_numbers
+    )
+
+
+# ============================================================
 # Window planning
 # ============================================================
 
@@ -430,10 +528,20 @@ def load_or_fetch_block_payload(
     )
 
     if app_config.storage.resume_from_cache and cache_path.exists():
-        logger.info("[%s][window=%s] Loading cached block %s", chain.name, window_blocks, block_number)
+        logger.info(
+            "[%s][window=%s] Loading cached block %s",
+            chain.name,
+            window_blocks,
+            block_number,
+        )
         return read_json(cache_path)
 
-    logger.info("[%s][window=%s] Fetching block %s", chain.name, window_blocks, block_number)
+    logger.info(
+        "[%s][window=%s] Fetching block %s",
+        chain.name,
+        window_blocks,
+        block_number,
+    )
     payload = client.get_block_by_number(
         chain=chain,
         block_number=block_number,
@@ -485,7 +593,6 @@ def extract_transactions_from_block_payload(
     for tx in txs:
         from_address = sanitize_address(tx.get("from"))
         if from_address is None:
-            # malformed tx payload; skip
             continue
 
         to_address = sanitize_address(tx.get("to"))
@@ -545,7 +652,7 @@ def save_raw_transactions(
     transactions: Sequence[RawTransactionRecord],
 ) -> Path:
     rows = [tx.to_dict() for tx in transactions]
-    path = write_table(
+    return write_table(
         rows=rows,
         path_without_suffix=transaction_table_path_base(
             app_config=app_config,
@@ -554,7 +661,6 @@ def save_raw_transactions(
         ),
         table_format=app_config.storage.table_format,
     )
-    return path
 
 
 def load_raw_transactions(
@@ -766,6 +872,11 @@ def resolve_address_codes_for_window(
     """
     Resolve eth_getCode for all unique addresses in the current chain/window,
     reusing chain-level cache so each address is checked once per chain.
+
+    Improvements:
+    - works in chunks
+    - persists cache after each chunk
+    - uses conservative parallelism in explorer-only mode
     """
     chain_cache = load_address_code_cache(app_config=app_config, chain=chain)
 
@@ -780,21 +891,64 @@ def resolve_address_codes_for_window(
     if app_config.sampling.max_addresses_for_code_lookup is not None:
         unresolved = unresolved[: app_config.sampling.max_addresses_for_code_lookup]
 
-    if unresolved:
+    if not unresolved:
         logger.info(
-            "[%s][window=%s] Resolving eth_getCode for %s uncached addresses",
+            "[%s][window=%s] All %s addresses already present in code cache",
             chain.name,
             window_blocks,
+            len(addresses),
+        )
+        snapshot_records: List[AddressCodeCacheRecord] = [
+            chain_cache[address]
+            for address in addresses
+            if address in chain_cache
+        ]
+        write_table(
+            rows=[item.to_dict() for item in snapshot_records],
+            path_without_suffix=address_code_snapshot_path_base(
+                app_config=app_config,
+                chain=chain,
+                window_blocks=window_blocks,
+            ),
+            table_format=app_config.storage.table_format,
+        )
+        return {record.address: record for record in snapshot_records}
+
+    logger.info(
+        "[%s][window=%s] Resolving eth_getCode for %s uncached addresses",
+        chain.name,
+        window_blocks,
+        len(unresolved),
+    )
+
+    max_workers = None if chain.rpc_url else 1
+    chunk_size = max(1, int(getattr(app_config.api, "batch_size", 25) or 25))
+    if not chain.rpc_url:
+        chunk_size = min(chunk_size, 10)
+
+    now = utc_now_iso()
+
+    for start_idx in range(0, len(unresolved), chunk_size):
+        chunk = unresolved[start_idx : start_idx + chunk_size]
+        end_idx = start_idx + len(chunk)
+
+        logger.info(
+            "[%s][window=%s] eth_getCode chunk %s-%s of %s",
+            chain.name,
+            window_blocks,
+            start_idx + 1,
+            end_idx,
             len(unresolved),
         )
-        batch_results: List[AddressCodeResult] = client.get_codes(
+
+        chunk_results: List[AddressCodeResult] = client.get_codes(
             chain=chain,
-            addresses=unresolved,
+            addresses=chunk,
             block_tag=block_tag,
+            max_workers=max_workers,
         )
 
-        now = utc_now_iso()
-        for item in batch_results:
+        for item in chunk_results:
             chain_cache[item.address] = AddressCodeCacheRecord(
                 chain=chain.name,
                 chain_id=chain.chain_id,
@@ -810,19 +964,13 @@ def resolve_address_codes_for_window(
             chain=chain,
             cache_records=list(chain_cache.values()),
         )
-    else:
-        logger.info(
-            "[%s][window=%s] All %s addresses already present in code cache",
-            chain.name,
-            window_blocks,
-            len(addresses),
-        )
 
     snapshot_records: List[AddressCodeCacheRecord] = [
         chain_cache[address]
         for address in addresses
         if address in chain_cache
     ]
+
     write_table(
         rows=[item.to_dict() for item in snapshot_records],
         path_without_suffix=address_code_snapshot_path_base(
@@ -926,16 +1074,33 @@ def run_block_window_ingestion_for_chain(
         window_blocks=window_blocks,
     )
 
-    # 2) Load cached transactions if available
+    # 2) Reuse cached transactions only if manifest matches this exact window
     cached_tx_rows: List[Dict[str, Any]] = []
+    cached_manifest = None
+    cache_is_valid = False
+
     if app_config.storage.resume_from_cache:
-        cached_tx_rows = load_raw_transactions(
+        cached_manifest = load_window_manifest(
             app_config=app_config,
             chain=chain,
             window_blocks=window_blocks,
         )
+        cache_is_valid = manifest_matches_plan(cached_manifest, plan)
 
-    if cached_tx_rows:
+        if cache_is_valid:
+            cached_tx_rows = load_raw_transactions(
+                app_config=app_config,
+                chain=chain,
+                window_blocks=window_blocks,
+            )
+        else:
+            logger.info(
+                "[%s][window=%s] Existing cache does not match current block window; rebuilding",
+                chain.name,
+                window_blocks,
+            )
+
+    if cached_tx_rows and cache_is_valid:
         logger.info(
             "[%s][window=%s] Loaded %s cached transaction rows",
             chain.name,
@@ -992,7 +1157,7 @@ def run_block_window_ingestion_for_chain(
         chain=chain,
         window_blocks=window_blocks,
         addresses=unique_addresses,
-        block_tag="latest",
+        block_tag=plan.reference_block_tag,
     )
 
     # 8) Enrich raw transactions with EOA flags
@@ -1092,11 +1257,15 @@ def raw_transaction_record_from_dict(row: Dict[str, Any]) -> RawTransactionRecor
         reference_block_number=int(row["reference_block_number"]),
         block_number=int(row["block_number"]),
         block_timestamp=(
-            int(row["block_timestamp"]) if row.get("block_timestamp") not in (None, "", "None") else None
+            int(row["block_timestamp"])
+            if row.get("block_timestamp") not in (None, "", "None")
+            else None
         ),
         tx_hash=str(row["tx_hash"]),
         tx_index=(
-            int(row["tx_index"]) if row.get("tx_index") not in (None, "", "None") else None
+            int(row["tx_index"])
+            if row.get("tx_index") not in (None, "", "None")
+            else None
         ),
         from_address=str(row["from_address"]).lower(),
         to_address=(
@@ -1112,5 +1281,6 @@ def raw_transaction_record_from_dict(row: Dict[str, Any]) -> RawTransactionRecor
             if row.get("gas_price_wei") not in (None, "", "None")
             else None
         ),
-        is_contract_creation=str(row["is_contract_creation"]).strip().lower() in {"1", "true", "yes"},
+        is_contract_creation=str(row["is_contract_creation"]).strip().lower()
+        in {"1", "true", "yes"},
     )

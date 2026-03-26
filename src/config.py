@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,10 +26,10 @@ def _parse_int_list(
     raw_value: Optional[str],
     default: Iterable[int],
 ) -> Tuple[int, ...]:
-    if raw_value is None or not raw_value.strip():
+    if raw_value is None or not str(raw_value).strip():
         values = list(default)
     else:
-        parts = [part.strip() for part in raw_value.split(",")]
+        parts = [part.strip() for part in str(raw_value).split(",")]
         values = []
         for part in parts:
             if not part:
@@ -49,30 +50,136 @@ def _parse_int_list(
     if not values:
         raise ValueError("At least one observation window must be configured.")
 
-    # unique + sorted for deterministic pipeline behavior
     unique_sorted = sorted(set(values))
     return tuple(unique_sorted)
 
 
-def _parse_non_empty_str(value: Optional[str]) -> Optional[str]:
+def _parse_non_empty_str(value: Optional[object]) -> Optional[str]:
     if value is None:
         return None
-    value = value.strip()
+    value = str(value).strip()
     return value if value else None
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return int(raw)
+def _load_json_config() -> dict:
+    config_path = os.getenv("CONFIG_JSON_PATH")
+    if not config_path:
+        return {}
+
+    path = Path(config_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"CONFIG_JSON_PATH does not exist: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        raise ValueError("JSON config root must be an object/dict.")
+
+    return payload
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return float(raw)
+def _json_get(config: dict, *keys, default=None):
+    current = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _get_value(
+    env_name: str,
+    json_config: dict,
+    json_keys: Tuple[str, ...],
+    default=None,
+):
+    env_value = os.getenv(env_name)
+    if env_value is not None and str(env_value).strip() != "":
+        return env_value
+
+    json_value = _json_get(json_config, *json_keys, default=None)
+    if json_value is not None:
+        return json_value
+
+    return default
+
+
+def _get_bool(
+    env_name: str,
+    json_config: dict,
+    json_keys: Tuple[str, ...],
+    default: bool,
+) -> bool:
+    env_value = os.getenv(env_name)
+    if env_value is not None:
+        return _str_to_bool(env_value, default=default)
+
+    json_value = _json_get(json_config, *json_keys, default=None)
+    if json_value is not None:
+        if isinstance(json_value, bool):
+            return json_value
+        return _str_to_bool(str(json_value), default=default)
+
+    return default
+
+
+def _get_int(
+    env_name: str,
+    json_config: dict,
+    json_keys: Tuple[str, ...],
+    default: int,
+) -> int:
+    value = _get_value(env_name, json_config, json_keys, default=default)
+    return int(value)
+
+
+def _get_float(
+    env_name: str,
+    json_config: dict,
+    json_keys: Tuple[str, ...],
+    default: float,
+) -> float:
+    value = _get_value(env_name, json_config, json_keys, default=default)
+    return float(value)
+
+
+def _get_block_windows(json_config: dict) -> Tuple[int, ...]:
+    env_raw = os.getenv("OBSERVATION_WINDOWS_BLOCKS")
+    if env_raw is not None and env_raw.strip():
+        return _parse_int_list(env_raw, default=(1, 10, 100))
+
+    json_value = _json_get(
+        json_config,
+        "sampling",
+        "observation_windows_blocks",
+        default=None,
+    )
+    if json_value is not None:
+        if not isinstance(json_value, list):
+            raise ValueError(
+                "sampling.observation_windows_blocks in JSON must be a list of ints"
+            )
+        values = [int(x) for x in json_value]
+        if not values or any(v <= 0 for v in values):
+            raise ValueError(
+                "sampling.observation_windows_blocks must contain positive integers"
+            )
+        return tuple(sorted(set(values)))
+
+    return (1, 10, 100)
+
+
+def _looks_like_explorer_api_url(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    return (
+        "api.etherscan.io" in normalized
+        or "etherscan.io/v2/api" in normalized
+        or normalized.endswith("/v2/api")
+        or "/api?module=" in normalized
+    )
 
 
 # -----------------------------
@@ -157,7 +264,6 @@ class PathConfig:
 
 @dataclass(frozen=True)
 class APIConfig:
-    # Transport / request behavior
     timeout_seconds: int = 30
     max_retries: int = 5
     backoff_base_seconds: float = 1.0
@@ -166,7 +272,6 @@ class APIConfig:
     batch_size: int = 25
     user_agent: str = "evm-cross-chain-correlation/2.0"
 
-    # Client strategy
     use_rpc_first: bool = True
     use_explorer_fallback: bool = True
 
@@ -192,8 +297,6 @@ class SamplingConfig:
     windows: WindowConfig
     reference_block_tag: str = "latest"
     full_transactions: bool = True
-
-    # Safety limits
     max_addresses_for_code_lookup: Optional[int] = None
 
     def validate(self) -> None:
@@ -244,7 +347,12 @@ class AppConfig:
                     f"{chain.approx_block_time_seconds}"
                 )
 
-        # At least one transport path should exist for each enabled chain.
+            if chain.rpc_url and _looks_like_explorer_api_url(chain.rpc_url):
+                raise ValueError(
+                    f"{chain.name}: rpc_url looks like an explorer API endpoint, "
+                    f"not a JSON-RPC URL: {chain.rpc_url}"
+                )
+
         missing_transport = [
             chain.name
             for chain in self.enabled_chains
@@ -262,11 +370,21 @@ class AppConfig:
 # -----------------------------
 
 
-def build_paths(project_root: str | Path | None = None) -> PathConfig:
-    if project_root is None:
-        project_root = os.getenv("PROJECT_ROOT", Path.cwd())
+def build_paths(
+    project_root: str | Path | None = None,
+    json_config: Optional[dict] = None,
+) -> PathConfig:
+    json_config = json_config or {}
 
-    root = Path(project_root).resolve()
+    if project_root is None:
+        project_root = _get_value(
+            "PROJECT_ROOT",
+            json_config,
+            ("project_root",),
+            default=Path.cwd(),
+        )
+
+    root = Path(project_root).expanduser().resolve()
 
     data_dir = root / "data"
     raw_dir = data_dir / "raw"
@@ -329,31 +447,62 @@ def _build_chain(
     explorer_key_env_name: str,
     enabled_default: bool,
     enabled_env_name: str,
+    json_config: dict,
+    explorer_base_env_name: Optional[str] = None,
     explorer_api_base_url: Optional[str] = None,
 ) -> ChainConfig:
-    shared_etherscan_key = _parse_non_empty_str(os.getenv("ETHERSCAN_API_KEY"))
-    explorer_api_key = _parse_non_empty_str(
-        os.getenv(explorer_key_env_name)
-    ) or shared_etherscan_key
+    json_chain = _json_get(json_config, "chains", name, default={}) or {}
+
+    rpc_url = _parse_non_empty_str(os.getenv(rpc_env_name))
+    if rpc_url is None:
+        rpc_url = _parse_non_empty_str(json_chain.get("rpc_url"))
+
+    explorer_api_key = _parse_non_empty_str(os.getenv(explorer_key_env_name))
+    if explorer_api_key is None:
+        explorer_api_key = _parse_non_empty_str(json_chain.get("explorer_api_key"))
+    if explorer_api_key is None:
+        explorer_api_key = _parse_non_empty_str(os.getenv("ETHERSCAN_API_KEY"))
+
+    enabled_env = os.getenv(enabled_env_name)
+    if enabled_env is not None:
+        enabled = _str_to_bool(enabled_env, default=enabled_default)
+    else:
+        enabled = bool(json_chain.get("enabled", enabled_default))
+
+    chain_base_from_env = None
+    if explorer_base_env_name:
+        chain_base_from_env = _parse_non_empty_str(os.getenv(explorer_base_env_name))
+
+    chain_base_from_json = _parse_non_empty_str(
+        json_chain.get("explorer_api_base_url")
+    )
+
+    global_base_from_env = _parse_non_empty_str(os.getenv("ETHERSCAN_BASE_URL"))
+    global_base_from_json = _parse_non_empty_str(
+        _json_get(json_config, "api", "explorer_api_base_url", default=None)
+    )
+
+    resolved_explorer_base = (
+        chain_base_from_env
+        or chain_base_from_json
+        or explorer_api_base_url
+        or global_base_from_env
+        or global_base_from_json
+        or "https://api.etherscan.io/v2/api"
+    )
 
     return ChainConfig(
         name=name,
         chain_id=chain_id,
         approx_block_time_seconds=approx_block_time_seconds,
-        rpc_url=_parse_non_empty_str(os.getenv(rpc_env_name)),
-        explorer_api_base_url=explorer_api_base_url
-        or os.getenv("ETHERSCAN_BASE_URL", "https://api.etherscan.io/v2/api"),
+        rpc_url=rpc_url,
+        explorer_api_base_url=resolved_explorer_base,
         explorer_api_key=explorer_api_key,
-        enabled=_str_to_bool(os.getenv(enabled_env_name), default=enabled_default),
+        enabled=enabled,
     )
 
 
-def build_default_chains() -> Dict[str, ChainConfig]:
-    """
-    Main project target according to the updated task:
-    Ethereum, Polygon, BNB Smart Chain.
-    Avalanche remains optional.
-    """
+def build_default_chains(json_config: dict) -> Dict[str, ChainConfig]:
     return {
         "ethereum": _build_chain(
             name="ethereum",
@@ -363,6 +512,8 @@ def build_default_chains() -> Dict[str, ChainConfig]:
             explorer_key_env_name="ETHEREUM_EXPLORER_API_KEY",
             enabled_default=True,
             enabled_env_name="ENABLE_ETHEREUM",
+            explorer_base_env_name="ETHEREUM_EXPLORER_BASE_URL",
+            json_config=json_config,
         ),
         "polygon": _build_chain(
             name="polygon",
@@ -372,6 +523,8 @@ def build_default_chains() -> Dict[str, ChainConfig]:
             explorer_key_env_name="POLYGON_EXPLORER_API_KEY",
             enabled_default=True,
             enabled_env_name="ENABLE_POLYGON",
+            explorer_base_env_name="POLYGON_EXPLORER_BASE_URL",
+            json_config=json_config,
         ),
         "bnb": _build_chain(
             name="bnb",
@@ -381,6 +534,8 @@ def build_default_chains() -> Dict[str, ChainConfig]:
             explorer_key_env_name="BNB_EXPLORER_API_KEY",
             enabled_default=True,
             enabled_env_name="ENABLE_BNB",
+            explorer_base_env_name="BNB_EXPLORER_BASE_URL",
+            json_config=json_config,
         ),
         "avalanche": _build_chain(
             name="avalanche",
@@ -390,6 +545,8 @@ def build_default_chains() -> Dict[str, ChainConfig]:
             explorer_key_env_name="AVALANCHE_EXPLORER_API_KEY",
             enabled_default=False,
             enabled_env_name="ENABLE_AVALANCHE",
+            explorer_base_env_name="AVALANCHE_EXPLORER_BASE_URL",
+            json_config=json_config,
         ),
     }
 
@@ -400,72 +557,141 @@ def build_default_chains() -> Dict[str, ChainConfig]:
 
 
 def load_config(project_root: str | Path | None = None) -> AppConfig:
-    paths = build_paths(project_root=project_root)
+    json_config = _load_json_config()
+
+    paths = build_paths(project_root=project_root, json_config=json_config)
     ensure_directories(paths)
 
     windows = WindowConfig(
-        block_counts=_parse_int_list(
-            os.getenv("OBSERVATION_WINDOWS_BLOCKS"),
-            default=(1, 10, 100),
-        )
+        block_counts=_get_block_windows(json_config)
     )
 
     api = APIConfig(
-        timeout_seconds=_env_int("API_TIMEOUT_SECONDS", 30),
-        max_retries=_env_int("API_MAX_RETRIES", 5),
-        backoff_base_seconds=_env_float("API_BACKOFF_BASE_SECONDS", 1.0),
-        requests_per_second=_env_float("API_REQUESTS_PER_SECOND", 4.0),
-        max_concurrency=_env_int("API_MAX_CONCURRENCY", 8),
-        batch_size=_env_int("API_BATCH_SIZE", 25),
-        user_agent=os.getenv(
-            "API_USER_AGENT",
-            "evm-cross-chain-correlation/2.0",
+        timeout_seconds=_get_int(
+            "API_TIMEOUT_SECONDS",
+            json_config,
+            ("api", "timeout_seconds"),
+            30,
         ),
-        use_rpc_first=_str_to_bool(os.getenv("USE_RPC_FIRST"), default=True),
-        use_explorer_fallback=_str_to_bool(
-            os.getenv("USE_EXPLORER_FALLBACK"),
-            default=True,
+        max_retries=_get_int(
+            "API_MAX_RETRIES",
+            json_config,
+            ("api", "max_retries"),
+            5,
+        ),
+        backoff_base_seconds=_get_float(
+            "API_BACKOFF_BASE_SECONDS",
+            json_config,
+            ("api", "backoff_base_seconds"),
+            1.0,
+        ),
+        requests_per_second=_get_float(
+            "API_REQUESTS_PER_SECOND",
+            json_config,
+            ("api", "requests_per_second"),
+            4.0,
+        ),
+        max_concurrency=_get_int(
+            "API_MAX_CONCURRENCY",
+            json_config,
+            ("api", "max_concurrency"),
+            8,
+        ),
+        batch_size=_get_int(
+            "API_BATCH_SIZE",
+            json_config,
+            ("api", "batch_size"),
+            25,
+        ),
+        user_agent=str(
+            _get_value(
+                "API_USER_AGENT",
+                json_config,
+                ("api", "user_agent"),
+                "evm-cross-chain-correlation/2.0",
+            )
+        ),
+        use_rpc_first=_get_bool(
+            "USE_RPC_FIRST",
+            json_config,
+            ("api", "use_rpc_first"),
+            True,
+        ),
+        use_explorer_fallback=_get_bool(
+            "USE_EXPLORER_FALLBACK",
+            json_config,
+            ("api", "use_explorer_fallback"),
+            True,
         ),
     )
 
     storage = StorageConfig(
-        table_format=os.getenv("TABLE_FORMAT", "parquet").strip().lower(),
-        save_raw_block_payloads=_str_to_bool(
-            os.getenv("SAVE_RAW_BLOCK_PAYLOADS"),
-            default=True,
+        table_format=str(
+            _get_value(
+                "TABLE_FORMAT",
+                json_config,
+                ("storage", "table_format"),
+                "parquet",
+            )
+        ).strip().lower(),
+        save_raw_block_payloads=_get_bool(
+            "SAVE_RAW_BLOCK_PAYLOADS",
+            json_config,
+            ("storage", "save_raw_block_payloads"),
+            True,
         ),
-        save_raw_transaction_rows=_str_to_bool(
-            os.getenv("SAVE_RAW_TRANSACTION_ROWS"),
-            default=True,
+        save_raw_transaction_rows=_get_bool(
+            "SAVE_RAW_TRANSACTION_ROWS",
+            json_config,
+            ("storage", "save_raw_transaction_rows"),
+            True,
         ),
-        save_checkpoints=_str_to_bool(
-            os.getenv("SAVE_CHECKPOINTS"),
-            default=True,
+        save_checkpoints=_get_bool(
+            "SAVE_CHECKPOINTS",
+            json_config,
+            ("storage", "save_checkpoints"),
+            True,
         ),
-        resume_from_cache=_str_to_bool(
-            os.getenv("RESUME_FROM_CACHE"),
-            default=True,
+        resume_from_cache=_get_bool(
+            "RESUME_FROM_CACHE",
+            json_config,
+            ("storage", "resume_from_cache"),
+            True,
         ),
     )
 
-    max_code_lookup_raw = _parse_non_empty_str(
-        os.getenv("MAX_ADDRESSES_FOR_CODE_LOOKUP")
+    max_code_lookup_raw = _get_value(
+        "MAX_ADDRESSES_FOR_CODE_LOOKUP",
+        json_config,
+        ("sampling", "max_addresses_for_code_lookup"),
+        default=None,
     )
     max_code_lookup = (
-        int(max_code_lookup_raw) if max_code_lookup_raw is not None else None
+        int(max_code_lookup_raw)
+        if max_code_lookup_raw not in (None, "", "None")
+        else None
     )
 
     sampling = SamplingConfig(
         windows=windows,
-        reference_block_tag=os.getenv("REFERENCE_BLOCK_TAG", "latest").strip().lower(),
-        full_transactions=_str_to_bool(
-            os.getenv("FULL_TRANSACTIONS"),
-            default=True,
+        reference_block_tag=str(
+            _get_value(
+                "REFERENCE_BLOCK_TAG",
+                json_config,
+                ("sampling", "reference_block_tag"),
+                "latest",
+            )
+        ).strip().lower(),
+        full_transactions=_get_bool(
+            "FULL_TRANSACTIONS",
+            json_config,
+            ("sampling", "full_transactions"),
+            True,
         ),
         max_addresses_for_code_lookup=max_code_lookup,
     )
 
-    all_chains = build_default_chains()
+    all_chains = build_default_chains(json_config=json_config)
     chains = {name: chain for name, chain in all_chains.items() if chain.enabled}
 
     config = AppConfig(

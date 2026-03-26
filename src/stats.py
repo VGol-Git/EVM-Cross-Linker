@@ -7,11 +7,11 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.stats import chi2_contingency, pearsonr, spearmanr
+from scipy.stats import chi2_contingency, fisher_exact, pearsonr, spearmanr
 
 from .classify import presence_matrix_path_base
 from .config import AppConfig
@@ -148,9 +148,37 @@ def _safe_float(value: Any) -> Optional[float]:
     return value
 
 
+def _to_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "null", "nan"}:
+            return None
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+    return None
+
+
+def _to_bool(value: Any) -> bool:
+    parsed = _to_optional_bool(value)
+    return bool(parsed) if parsed is not None else False
+
+
+def _coerce_bool_series(series: pd.Series) -> pd.Series:
+    return series.map(_to_bool).fillna(False).astype(bool)
+
+
 def _json_series_to_dict(payload: Any) -> Dict[str, float]:
     if payload is None:
         return {}
+
     if isinstance(payload, dict):
         out = {}
         for key, value in payload.items():
@@ -243,8 +271,17 @@ def load_presence_matrix(
     _validate_columns(df, ["address"], f"{status_name} presence matrix")
 
     chain_cols = [col for col in df.columns if col != "address"]
+
     for col in chain_cols:
-        df[col] = df[col].fillna(False).astype(bool)
+        if not pd.api.types.is_bool_dtype(df[col]):
+            logger.info(
+                "[stats][window=%s][%s] Coercing presence column '%s' from dtype=%s to bool",
+                window_blocks,
+                status_name,
+                col,
+                df[col].dtype,
+            )
+        df[col] = _coerce_bool_series(df[col])
 
     df["address"] = df["address"].astype(str).str.lower()
     return df
@@ -263,8 +300,8 @@ def build_contingency_table(
 ) -> np.ndarray:
     _validate_columns(presence_df, ["address", chain_a, chain_b], "presence_df")
 
-    mask_a = presence_df[chain_a].fillna(False).astype(bool).to_numpy()
-    mask_b = presence_df[chain_b].fillna(False).astype(bool).to_numpy()
+    mask_a = _coerce_bool_series(presence_df[chain_a]).to_numpy()
+    mask_b = _coerce_bool_series(presence_df[chain_b]).to_numpy()
 
     present_present = int(np.logical_and(mask_a, mask_b).sum())
     present_absent = int(np.logical_and(mask_a, np.logical_not(mask_b)).sum())
@@ -294,14 +331,14 @@ def chi_square_test_for_pair(
         chain_b=chain_b,
     )
 
-    chi2_stat, p_value, dof, expected = chi2_contingency(contingency, correction=False)
-
-    mask_a = presence_df[chain_a].fillna(False).astype(bool).to_numpy()
-    mask_b = presence_df[chain_b].fillna(False).astype(bool).to_numpy()
+    mask_a = _coerce_bool_series(presence_df[chain_a]).to_numpy()
+    mask_b = _coerce_bool_series(presence_df[chain_b]).to_numpy()
 
     observed_jaccard = _compute_jaccard(mask_a, mask_b)
+    row_sums = contingency.sum(axis=1)
+    col_sums = contingency.sum(axis=0)
 
-    return {
+    row: Dict[str, Any] = {
         "window_blocks": window_blocks,
         "status_name": status_name,
         "chain_a": chain_a,
@@ -312,18 +349,85 @@ def chi_square_test_for_pair(
         "intersection_size": int(np.logical_and(mask_a, mask_b).sum()),
         "union_size": int(np.logical_or(mask_a, mask_b).sum()),
         "observed_jaccard": observed_jaccard,
-        "chi2_stat": float(chi2_stat),
-        "chi2_p_value": float(p_value),
-        "chi2_dof": int(dof),
+        "chi2_valid": True,
+        "chi2_error_reason": None,
+        "chi2_stat": None,
+        "chi2_p_value": None,
+        "chi2_dof": None,
+        "fisher_valid": False,
+        "fisher_error_reason": None,
+        "fisher_odds_ratio": None,
+        "fisher_p_value": None,
         "contingency_present_present": int(contingency[0, 0]),
         "contingency_present_absent": int(contingency[0, 1]),
         "contingency_absent_present": int(contingency[1, 0]),
         "contingency_absent_absent": int(contingency[1, 1]),
-        "expected_present_present": float(expected[0, 0]),
-        "expected_present_absent": float(expected[0, 1]),
-        "expected_absent_present": float(expected[1, 0]),
-        "expected_absent_absent": float(expected[1, 1]),
+        "expected_present_present": None,
+        "expected_present_absent": None,
+        "expected_absent_present": None,
+        "expected_absent_absent": None,
     }
+
+    # Fisher exact is robust for sparse 2x2 tables, so we try it regardless.
+    try:
+        fisher_odds_ratio, fisher_p_value = fisher_exact(contingency)
+        row["fisher_valid"] = True
+        row["fisher_odds_ratio"] = float(fisher_odds_ratio)
+        row["fisher_p_value"] = float(fisher_p_value)
+    except Exception as exc:
+        row["fisher_valid"] = False
+        row["fisher_error_reason"] = str(exc)
+        logger.warning(
+            "[stats][window=%s][%s][%s vs %s] Fisher exact failed: %s; contingency=%s",
+            window_blocks,
+            status_name,
+            chain_a,
+            chain_b,
+            exc,
+            contingency.tolist(),
+        )
+
+    # Chi-square is not valid for some degenerate sparse cases.
+    if np.any(row_sums == 0) or np.any(col_sums == 0):
+        row["chi2_valid"] = False
+        row["chi2_error_reason"] = "degenerate_zero_row_or_column"
+        logger.warning(
+            "[stats][window=%s][%s][%s vs %s] Skipping chi-square due to degenerate contingency table=%s",
+            window_blocks,
+            status_name,
+            chain_a,
+            chain_b,
+            contingency.tolist(),
+        )
+        return row
+
+    try:
+        chi2_stat, p_value, dof, expected = chi2_contingency(
+            contingency,
+            correction=False,
+        )
+        row["chi2_valid"] = True
+        row["chi2_stat"] = float(chi2_stat)
+        row["chi2_p_value"] = float(p_value)
+        row["chi2_dof"] = int(dof)
+        row["expected_present_present"] = float(expected[0, 0])
+        row["expected_present_absent"] = float(expected[0, 1])
+        row["expected_absent_present"] = float(expected[1, 0])
+        row["expected_absent_absent"] = float(expected[1, 1])
+    except ValueError as exc:
+        row["chi2_valid"] = False
+        row["chi2_error_reason"] = str(exc)
+        logger.warning(
+            "[stats][window=%s][%s][%s vs %s] Chi-square fallback triggered: %s; contingency=%s",
+            window_blocks,
+            status_name,
+            chain_a,
+            chain_b,
+            exc,
+            contingency.tolist(),
+        )
+
+    return row
 
 
 def permutation_test_for_pair(
@@ -339,8 +443,8 @@ def permutation_test_for_pair(
 
     _validate_columns(presence_df, ["address", chain_a, chain_b], "presence_df")
 
-    mask_a = presence_df[chain_a].fillna(False).astype(bool).to_numpy()
-    mask_b = presence_df[chain_b].fillna(False).astype(bool).to_numpy()
+    mask_a = _coerce_bool_series(presence_df[chain_a]).to_numpy()
+    mask_b = _coerce_bool_series(presence_df[chain_b]).to_numpy()
 
     observed = _compute_jaccard(mask_a, mask_b)
 
@@ -383,9 +487,22 @@ def run_presence_statistics_for_status(
     config = config or StatsConfig()
 
     if presence_df.empty:
+        logger.info(
+            "[stats][window=%s][%s] Presence matrix is empty; skipping pairwise presence statistics",
+            window_blocks,
+            status_name,
+        )
         return pd.DataFrame()
 
     chain_cols = [col for col in presence_df.columns if col != "address"]
+    if len(chain_cols) < 2:
+        logger.info(
+            "[stats][window=%s][%s] Fewer than 2 chains present; skipping pairwise presence statistics",
+            window_blocks,
+            status_name,
+        )
+        return pd.DataFrame()
+
     rows: List[Dict[str, Any]] = []
 
     for i, chain_a in enumerate(chain_cols):
@@ -640,7 +757,13 @@ def summarize_daily_series_correlations(
     if per_address_df.empty:
         return pd.DataFrame()
 
-    numeric_cols = ["aligned_days", "pearson_r", "pearson_p_value", "spearman_r", "spearman_p_value"]
+    numeric_cols = [
+        "aligned_days",
+        "pearson_r",
+        "pearson_p_value",
+        "spearman_r",
+        "spearman_p_value",
+    ]
     df = _coerce_numeric(per_address_df, numeric_cols)
 
     rows = []
@@ -810,14 +933,30 @@ def build_window_stats_summary(
                     "section": "presence",
                     "name": status_name,
                     "row_count": 0,
+                    "valid_chi2_pairs": 0,
                     "significant_chi2_pairs": 0,
+                    "significant_fisher_pairs": 0,
                     "significant_empirical_pairs": 0,
                 }
             )
             continue
 
-        chi_sig = int((pd.to_numeric(df["chi2_p_value"], errors="coerce") < 0.05).fillna(False).sum())
-        emp_sig = int((pd.to_numeric(df["empirical_p_value"], errors="coerce") < 0.05).fillna(False).sum())
+        chi_valid = int(_coerce_bool_series(df["chi2_valid"]).sum()) if "chi2_valid" in df.columns else 0
+        chi_sig = int(
+            (
+                pd.to_numeric(df.get("chi2_p_value"), errors="coerce") < 0.05
+            ).fillna(False).sum()
+        ) if "chi2_p_value" in df.columns else 0
+        fisher_sig = int(
+            (
+                pd.to_numeric(df.get("fisher_p_value"), errors="coerce") < 0.05
+            ).fillna(False).sum()
+        ) if "fisher_p_value" in df.columns else 0
+        emp_sig = int(
+            (
+                pd.to_numeric(df.get("empirical_p_value"), errors="coerce") < 0.05
+            ).fillna(False).sum()
+        ) if "empirical_p_value" in df.columns else 0
 
         rows.append(
             {
@@ -825,7 +964,9 @@ def build_window_stats_summary(
                 "section": "presence",
                 "name": status_name,
                 "row_count": int(len(df)),
+                "valid_chi2_pairs": chi_valid,
                 "significant_chi2_pairs": chi_sig,
+                "significant_fisher_pairs": fisher_sig,
                 "significant_empirical_pairs": emp_sig,
             }
         )
@@ -844,14 +985,14 @@ def build_window_stats_summary(
         )
     else:
         pearson_sig = int(
-            (pd.to_numeric(feature_stats_df["pearson_p_value"], errors="coerce") < 0.05)
-            .fillna(False)
-            .sum()
+            (
+                pd.to_numeric(feature_stats_df["pearson_p_value"], errors="coerce") < 0.05
+            ).fillna(False).sum()
         )
         spearman_sig = int(
-            (pd.to_numeric(feature_stats_df["spearman_p_value"], errors="coerce") < 0.05)
-            .fillna(False)
-            .sum()
+            (
+                pd.to_numeric(feature_stats_df["spearman_p_value"], errors="coerce") < 0.05
+            ).fillna(False).sum()
         )
         rows.append(
             {
