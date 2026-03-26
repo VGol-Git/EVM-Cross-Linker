@@ -1,0 +1,53 @@
+{
+  "project_root": "C:/Users/Asus Zephyrus 16/Documents/cross_chain_wallet_profiling",
+
+  "api": {
+    "requests_per_second": 10,
+    "max_concurrency": 4,
+    "timeout_seconds": 30,
+    "max_retries": 5,
+    "backoff_base_seconds": 1.0,
+    "batch_size": 50,
+    "user_agent": "evm-cross-chain-correlation/2.0",
+    "use_rpc_first": true,
+    "use_explorer_fallback": true
+  },
+
+  "storage": {
+    "table_format": "csv",
+    "save_raw_block_payloads": true,
+    "save_raw_transaction_rows": true,
+    "save_checkpoints": true,
+    "resume_from_cache": true
+  },
+
+  "sampling": {
+    "observation_windows_blocks": [100],
+    "reference_block_tag": "latest",
+    "full_transactions": true,
+    "max_addresses_for_code_lookup": null
+  },
+
+  "chains": {
+    "ethereum": {
+      "enabled": true,
+      "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/jXwnU3n6MuiGbM_GmBQbN",
+      "explorer_api_key": "PKTQ3EIP5S32V2S9XN6YYYBJWYKZYC2T6Y"
+    },
+    "polygon": {
+      "enabled": true,
+      "rpc_url": "https://polygon-mainnet.g.alchemy.com/v2/jXwnU3n6MuiGbM_GmBQbN",
+      "explorer_api_key": "PKTQ3EIP5S32V2S9XN6YYYBJWYKZYC2T6Y"
+    },
+    "bnb": {
+      "enabled": true,
+      "rpc_url": "https://bsc-mainnet.core.chainstack.com/0b64b28c26b574de0df4d667a11033ac",
+      "explorer_api_key": "PKTQ3EIP5S32V2S9XN6YYYBJWYKZYC2T6Y"
+    },
+    "avalanche": {
+      "enabled": false,
+      "rpc_url": null,
+      "explorer_api_key": null
+    }
+  }
+}

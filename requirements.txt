@@ -10,3 +10,4 @@ black
 ruff
 mypy
 pytest
+scipy
