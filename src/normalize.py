@@ -174,7 +174,7 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         "recent_90d_tx_count",
         "days_since_last_active",
         "lifetime_days",
-        "observation_window_days",
+        "observation_window_blocks",
     ]
     out = _ensure_numeric(out, numeric_candidates)
 

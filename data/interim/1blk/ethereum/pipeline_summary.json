@@ -1,0 +1,15 @@
+{
+  "chain": "ethereum",
+  "window_blocks": 1,
+  "blocks_in_window": 1,
+  "blocks_fetched": 1,
+  "start_block": 24739500,
+  "end_block": 24739500,
+  "total_addresses_extracted": 467,
+  "pre_eoa_active": 302,
+  "pre_eoa_passive": 138,
+  "active_eoas": 281,
+  "passive_eoas": 55,
+  "total_eoas": 336,
+  "output_dir": "C:\\Users\\Pro\\Downloads\\blockchain_proj\\EVM-Cross-Linker\\data\\interim\\1blk\\ethereum"
+}

@@ -1,0 +1,3 @@
+chain,window_blocks,blocks_in_window,blocks_fetched,start_block,end_block,total_addresses_extracted,pre_eoa_active,pre_eoa_passive,active_eoas,passive_eoas,total_eoas,output_dir
+polygon,1,1,1,84690560,84690560,208,149,54,146,8,154,C:\Users\Pro\Downloads\blockchain_proj\EVM-Cross-Linker\data\interim\1blk\polygon
+ethereum,1,1,1,24739500,24739500,467,302,138,281,55,336,C:\Users\Pro\Downloads\blockchain_proj\EVM-Cross-Linker\data\interim\1blk\ethereum

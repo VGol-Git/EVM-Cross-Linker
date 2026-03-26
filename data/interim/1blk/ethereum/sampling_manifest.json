@@ -1,0 +1,16 @@
+{
+  "created_at": "2026-03-26T04:59:18.124593+00:00",
+  "chain": "ethereum",
+  "chain_id": 1,
+  "window_blocks": 1,
+  "latest_block": 24739500,
+  "latest_block_timestamp": 1774501151,
+  "start_block": 24739500,
+  "end_block": 24739500,
+  "blocks_in_window": 1,
+  "blocks_fetched": 1,
+  "fetched_all_blocks": true,
+  "sampled_block_numbers": [
+    24739500
+  ]
+}

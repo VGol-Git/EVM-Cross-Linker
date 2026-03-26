@@ -1,0 +1,40 @@
+{
+  "address": "0x055036750ec6625b7c970d2d61435a7772bdd63b",
+  "chain": "polygon",
+  "chain_id": 137,
+  "fetched_at": "2026-03-26T05:03:10.388728+00:00",
+  "snapshot_ts": 1774501390,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 1,
+      "rows": [
+        {
+          "hash": "0x3946730636c4f8619729d40130418ba967da057a2568bad120a14329cdaaadbf",
+          "blockNumber": "84187402",
+          "timeStamp": "1773494837",
+          "from": "0x8129b737912e17212c8693b781928f5d0303390a",
+          "to": "0x055036750ec6625b7c970d2d61435a7772bdd63b",
+          "value": "50",
+          "contractAddress": "0xe18fcc9c23460ac1256bc7bdf0d557da82ff8b2c",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "REWARD 🎁 t .me/s/sol_shiba",
+          "category": "erc20"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

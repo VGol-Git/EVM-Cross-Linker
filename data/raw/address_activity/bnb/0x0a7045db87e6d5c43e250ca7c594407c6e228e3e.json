@@ -1,0 +1,40 @@
+{
+  "address": "0x0a7045db87e6d5c43e250ca7c594407c6e228e3e",
+  "chain": "bnb",
+  "chain_id": 56,
+  "fetched_at": "2026-03-26T05:06:53.732796+00:00",
+  "snapshot_ts": 1774501613,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 1,
+      "rows": [
+        {
+          "hash": "0x5a96de4c65d5207df1026be2cd56d7a1574c4c2161c838071bc5aef8d0016588",
+          "blockNumber": "74414526",
+          "timeStamp": "0",
+          "from": "0x053577f23edd3d6bf15fc53db9ca8042d4796fa7",
+          "to": "0x0a7045db87e6d5c43e250ca7c594407c6e228e3e",
+          "value": "21756452000000000",
+          "contractAddress": "0x18d0e455b3491e09210292d3953157a4bf104444",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "比特币",
+          "category": "erc20"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

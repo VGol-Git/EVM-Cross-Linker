@@ -1,0 +1,56 @@
+{
+  "address": "0x004bb76d01438b9017a85356fa3734b3d9fcb090",
+  "chain": "polygon",
+  "chain_id": 137,
+  "fetched_at": "2026-03-26T05:01:23.082410+00:00",
+  "snapshot_ts": 1774501283,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 1,
+      "rows": [
+        {
+          "hash": "0xacd67427708421b7b5bc6e2b363c88d4b41e5fcbfe360c200fb3204486480ab1",
+          "blockNumber": "84690560",
+          "timeStamp": "1774501155",
+          "from": "0xe93cbec0c5509b75c1aabdbe01f95966b2293ee2",
+          "to": "0x004bb76d01438b9017a85356fa3734b3d9fcb090",
+          "value": "3000000000000000000",
+          "contractAddress": "",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "MATIC",
+          "category": "external"
+        }
+      ]
+    },
+    "erc20": {
+      "count": 1,
+      "rows": [
+        {
+          "hash": "0xa1e2e81f82e4ba05d3b4f73be24513511ec59e8818c5952f6380a1198d285092",
+          "blockNumber": "84690563",
+          "timeStamp": "1774501161",
+          "from": "0xe93c68007181685affeb1c3e6b84d4c6b2293ee2",
+          "to": "0x004bb76d01438b9017a85356fa3734b3d9fcb090",
+          "value": "3000000000000000000",
+          "contractAddress": "0xf7ac54a984e9e942742f5b9ea94bdca8f1c39309",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "Ρ0Ⅼ",
+          "category": "erc20"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

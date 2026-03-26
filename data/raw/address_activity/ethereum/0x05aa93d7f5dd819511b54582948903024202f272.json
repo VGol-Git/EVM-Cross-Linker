@@ -1,0 +1,102 @@
+{
+  "address": "0x05aa93d7f5dd819511b54582948903024202f272",
+  "chain": "ethereum",
+  "chain_id": 1,
+  "fetched_at": "2026-03-26T05:03:23.986025+00:00",
+  "snapshot_ts": 1774501403,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 2,
+      "rows": [
+        {
+          "hash": "0x13e8e5c3b9fa078af70e798008ba30175f0c7d9879205749335ac65ca7b09614",
+          "blockNumber": "24733380",
+          "timeStamp": "1774427339",
+          "from": "0x05aa93d7f5dd819511b54582948903024202f272",
+          "to": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+          "value": "0",
+          "contractAddress": "",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "ETH",
+          "category": "external"
+        },
+        {
+          "hash": "0x45fdfc6ebe21c9401eb838e1c43bcde7e9196653311d6b5c978a0a2964154028",
+          "blockNumber": "24739500",
+          "timeStamp": "1774501151",
+          "from": "0x05aa93d7f5dd819511b54582948903024202f272",
+          "to": "0xb254b2f960faf69356791e77d46a96398444bbfb",
+          "value": "1268815443196",
+          "contractAddress": "",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "ETH",
+          "category": "external"
+        }
+      ]
+    },
+    "erc20": {
+      "count": 2,
+      "rows": [
+        {
+          "hash": "0x13e8e5c3b9fa078af70e798008ba30175f0c7d9879205749335ac65ca7b09614",
+          "blockNumber": "24733380",
+          "timeStamp": "1774427339",
+          "from": "0x05aa93d7f5dd819511b54582948903024202f272",
+          "to": "0xd7fe9f4648869211122055bc1f4694958d0b408a",
+          "value": "150",
+          "contractAddress": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "USDT",
+          "category": "erc20"
+        },
+        {
+          "hash": "0xb26bfaef9eb8bcbaf6f7f36cec4c23dfb8d5a1b034e984a3a31ba46d92461757",
+          "blockNumber": "24733375",
+          "timeStamp": "1774427279",
+          "from": "0xc727eb69ccf89d5911042f21be25a193d67e2c23",
+          "to": "0x05aa93d7f5dd819511b54582948903024202f272",
+          "value": "150",
+          "contractAddress": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "USDT",
+          "category": "erc20"
+        }
+      ]
+    },
+    "internal": {
+      "count": 1,
+      "rows": [
+        {
+          "hash": "0xb26bfaef9eb8bcbaf6f7f36cec4c23dfb8d5a1b034e984a3a31ba46d92461757",
+          "blockNumber": "24733375",
+          "timeStamp": "1774427279",
+          "from": "0xc727eb69ccf89d5911042f21be25a193d67e2c23",
+          "to": "0x05aa93d7f5dd819511b54582948903024202f272",
+          "value": "3764417992500",
+          "contractAddress": "",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "ETH",
+          "category": "internal"
+        }
+      ]
+    }
+  }
+}

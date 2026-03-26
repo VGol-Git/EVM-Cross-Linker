@@ -1,0 +1,48 @@
+{
+  "address": "0x00d988a1cf2b9935d33ba0a324f09fb42fa08448",
+  "chain": "polygon",
+  "chain_id": 137,
+  "fetched_at": "2026-03-26T00:16:53.753907+00:00",
+  "snapshot_ts": 1774484213,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 1,
+      "rows": [
+        {
+          "blockNumber": "83711467",
+          "timeStamp": "1772542965",
+          "hash": "0x79c0fd1d201a637bf498165ff08cecafbf59df8319eb033812a5ee8971219732",
+          "nonce": "541",
+          "blockHash": "0xfebcec99b628326607fdfd3e5df087ae93138f958d84157418a6ded10db28fd2",
+          "from": "0x8129b737912e17212c8693b781928f5d0303390a",
+          "contractAddress": "0xc8c4db15e07d0f30558eaab922bf2631550a266e",
+          "to": "0x00d988a1cf2b9935d33ba0a324f09fb42fa08448",
+          "value": "50",
+          "tokenName": "REWARD 🎁 Visit: t .me/app_dydx",
+          "tokenSymbol": "REWARD 🎁 Visit: t .me/app_dydx",
+          "tokenDecimal": "0",
+          "transactionIndex": "200",
+          "gas": "258165",
+          "gasPrice": "228129474261",
+          "gasUsed": "254974",
+          "cumulativeGasUsed": "43525209",
+          "input": "deprecated",
+          "methodId": "0x729ad39e",
+          "functionName": "airdrop(address[] users)",
+          "confirmations": "970616"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

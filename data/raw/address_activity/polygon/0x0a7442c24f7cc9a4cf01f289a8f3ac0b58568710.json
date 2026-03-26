@@ -1,0 +1,85 @@
+{
+  "address": "0x0a7442c24f7cc9a4cf01f289a8f3ac0b58568710",
+  "chain": "polygon",
+  "chain_id": 137,
+  "fetched_at": "2026-03-26T05:07:01.802962+00:00",
+  "snapshot_ts": 1774501621,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 4,
+      "rows": [
+        {
+          "hash": "0x9e89d00c5ba1e2efbe7a52cb381c45c126f7eec6a57e2503849d208aca14db5b",
+          "blockNumber": "79284393",
+          "timeStamp": "1763673817",
+          "from": "0xdf2140dee6b07ae495382bc1cd446f7b328f63e3",
+          "to": "0x0a7442c24f7cc9a4cf01f289a8f3ac0b58568710",
+          "value": "2910",
+          "contractAddress": "0xa9cc6714c5d24ab7a91c013f0fa09360e7e22f1c",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "PAWS | t.me/s/PAWS_POOL | claim yours",
+          "category": "erc20"
+        },
+        {
+          "hash": "0xa0491607bbb8f33654d20e828ddb9f74d864634d35b331969bc82b35b23c28f2",
+          "blockNumber": "80358960",
+          "timeStamp": "1765823453",
+          "from": "0x239b9c1f24f3423062b0d364796e07ee905e9fce",
+          "to": "0x0a7442c24f7cc9a4cf01f289a8f3ac0b58568710",
+          "value": "5555",
+          "contractAddress": "0xaf11ac8a7be43ed46c6ba2631cd296e6ffcc4d42",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "⭐Airdrop: solshiba .live",
+          "category": "erc20"
+        },
+        {
+          "hash": "0x63ac1aceaf47de8ad7da235f6a7a03cb01d03e030aa1bdbd29ddf3810febb325",
+          "blockNumber": "81062942",
+          "timeStamp": "1767245143",
+          "from": "0x239b9c1f24f3423062b0d364796e07ee905e9fce",
+          "to": "0x0a7442c24f7cc9a4cf01f289a8f3ac0b58568710",
+          "value": "3",
+          "contractAddress": "0x62fd329a7912fe599f1fe9223892ce02fd698c4d",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "REWARD 🎁🎁🎁 solshiba .top",
+          "category": "erc20"
+        },
+        {
+          "hash": "0x6552d03f53832e398eca384d3394a2d8a8638b455611dad2146757d98d7b8e15",
+          "blockNumber": "84070537",
+          "timeStamp": "1773261107",
+          "from": "0x8129b737912e17212c8693b781928f5d0303390a",
+          "to": "0x0a7442c24f7cc9a4cf01f289a8f3ac0b58568710",
+          "value": "50",
+          "contractAddress": "0x6b6bc1b0cbdb8454593b04a9465d3c8a966dffac",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "REWARD 🎁 t .me/s/sol_shiba",
+          "category": "erc20"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "ethereum": "alchemy",
+  "polygon": "alchemy",
+  "bnb": "alchemy"
+}

@@ -1,0 +1,24 @@
+{
+  "address": "0x004bb76d01438b9017a85356fa3734b3d9fcb090",
+  "chain": "bnb",
+  "chain_id": 56,
+  "fetched_at": "2026-03-26T05:01:24.431261+00:00",
+  "snapshot_ts": 1774501284,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 0,
+      "rows": []
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

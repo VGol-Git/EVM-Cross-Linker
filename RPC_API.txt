@@ -1,0 +1,52 @@
+Ethereum: 
+
+- etherscan (https://etherscan.io/apidashboard): PKTQ3EIP5S32V2S9XN6YYYBJWYKZYC2T6Y, JDQ8JSW9YA84YYG4QSKBWZCPS5BNCAF5HFPS4QTBQ317EXD7H9DXNN6RHXVX764BHBKV 
+https://api.etherscan.io/v2/api
+
+-blockscout (https://dev.blockscout.com/) (Ethereum, polygon): proapi_f8HwxYu51jRFX36m2gOjarFLcxukqvxzHrwu33GPXnjDEb9LBHYtEd3Wn8ZxjwaCy_bOWLqs
+https://api.blockscout.com/1/api/v2/addresses/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/transactions?apikey=proapi_f8HwxYu51jRFX36m2gOjarFLcxukqvxzHrwu33GPXnjDEb9LBHYtEd3Wn8ZxjwaCy_bOWLqs
+
+- Routescan (https://routescan.io/rpcs): rs_f6b3d9e2ed285de3424a0237
+
+ROUTESCAN_API_KEY = os.getenv("ROUTESCAN_API_KEY")
+
+base_url = "https://api.routescan.io/v2/network/mainnet/evm/etherscan/api"
+params = {
+    "module": "proxy",
+    "action": "eth_blockNumber",
+    "apikey": ROUTESCAN_API_KEY,
+}
+
+
+- alchemy (https://dashboard.alchemy.com/apps/en8005bkovtzcbjy/setup): jXwnU3n6MuiGbM_GmBQbN
+https://eth-mainnet.g.alchemy.com/v2/jXwnU3n6MuiGbM_GmBQbN
+
+curl https://eth-mainnet.g.alchemy.com/v2/jXwnU3n6MuiGbM_GmBQbN \
+     --request POST \
+     --header 'accept: application/json' \
+     --header 'content-type: application/json' \
+     --data '{"id":1,"jsonrpc":"2.0","method":"eth_blockNumber"}'
+nodereal (https://dashboard.nodereal.io/): b521ff62724e4d7c8283ab3aea9e1387
+https://eth-mainnet.nodereal.io/v1/b521ff62724e4d7c8283ab3aea9e1387
+
+polygon:
+- polygonscan (https://polygonscan.com/apidashboard): PKTQ3EIP5S32V2S9XN6YYYBJWYKZYC2T6Y, JDQ8JSW9YA84YYG4QSKBWZCPS5BNCAF5HFPS4QTBQ317EXD7H9DXNN6RHXVX764BHBKV
+
+- alchemy (https://dashboard.alchemy.com/apps/en8005bkovtzcbjy/setup): jXwnU3n6MuiGbM_GmBQbN
+
+-moralis (https://admin.moralis.com/api-keys): eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6Ijg1YWQxMTE0LTdmNDEtNDMyMC04NzBkLTAwMjg2MDZjMTdlNSIsIm9yZ0lkIjoiNTA3MDM1IiwidXNlcklkIjoiNTIxNzA4IiwidHlwZUlkIjoiM2IzNWIyMDYtYzAxZC00ZjlmLThjZmYtNWFjNjM3MWMwZmE5IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NzQ0NjI2MjgsImV4cCI6NDkzMDIyMjYyOH0.PndGTKQVAC8A7pbOouP6oLAV-J-IQgzMhpgZ9sHt0Jo
+bsc
+- bscscan (https://bscscan.com/apidashboard): PKTQ3EIP5S32V2S9XN6YYYBJWYKZYC2T6Y, JDQ8JSW9YA84YYG4QSKBWZCPS5BNCAF5HFPS4QTBQ317EXD7H9DXNN6RHXVX764BHBKV
+
+- alchemy (https://dashboard.alchemy.com/apps/en8005bkovtzcbjy/setup): jXwnU3n6MuiGbM_GmBQbN
+curl https://bnb-mainnet.g.alchemy.com/v2/jXwnU3n6MuiGbM_GmBQbN \
+     --request POST \
+     --header 'accept: application/json' \
+     --header 'content-type: application/json' \
+     --data '{"id":1,"jsonrpc":"2.0","method":"eth_blockNumber"}'
+
+- chainstack (https://console.chainstack.com/projects/PR-647-453/networks/NW-725-384-6/nodes/ND-513-669-013)(Ethereum на нем тоже есть, но нужен аккаунт. Тут на одну сеть один аккаунт): https://bsc-mainnet.core.chainstack.com/0b64b28c26b574de0df4d667a11033ac
+
+bsctrace (https://bsctrace.com/), nodereal (https://dashboard.nodereal.io/): b521ff62724e4d7c8283ab3aea9e1387
+
+https://bsc-mainnet.nodereal.io/v1/b521ff62724e4d7c8283ab3aea9e1387

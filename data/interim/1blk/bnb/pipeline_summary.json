@@ -1,0 +1,15 @@
+{
+  "chain": "bnb",
+  "window_blocks": 1,
+  "blocks_in_window": 1,
+  "blocks_fetched": 1,
+  "start_block": 88780991,
+  "end_block": 88780991,
+  "total_addresses_extracted": 83,
+  "pre_eoa_active": 45,
+  "pre_eoa_passive": 37,
+  "active_eoas": 42,
+  "passive_eoas": 7,
+  "total_eoas": 49,
+  "output_dir": "C:\\Users\\Pro\\Downloads\\blockchain_proj\\EVM-Cross-Linker\\data\\interim\\1blk\\bnb"
+}

@@ -1,0 +1,24 @@
+{
+  "address": "0x00c98af45bbbb12cbc968eb9daa7b8eb334f0a86",
+  "chain": "polygon",
+  "chain_id": 137,
+  "fetched_at": "2026-03-26T00:15:30.563540+00:00",
+  "snapshot_ts": 1774484130,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 0,
+      "rows": []
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

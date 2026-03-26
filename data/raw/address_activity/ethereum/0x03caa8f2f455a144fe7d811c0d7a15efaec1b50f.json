@@ -1,0 +1,70 @@
+{
+  "address": "0x03caa8f2f455a144fe7d811c0d7a15efaec1b50f",
+  "chain": "ethereum",
+  "chain_id": 1,
+  "fetched_at": "2026-03-26T05:02:53.088730+00:00",
+  "snapshot_ts": 1774501373,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 3,
+      "rows": [
+        {
+          "hash": "0xd0d318a40e550f2d20b1ea5ae27de22751edce44a3007219ebf5978a11d10154",
+          "blockNumber": "24739504",
+          "timeStamp": "1774501199",
+          "from": "0x03caa8f2f455a144fe7d811c0d7a15efaec1b50f",
+          "to": "0x2cff890f0378a11913b6129b2e97417a2c302680",
+          "value": "6976680000000000",
+          "contractAddress": "",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "ETH",
+          "category": "external"
+        },
+        {
+          "hash": "0x6c2a12e22f9e3db6b5d1e1c31cc62e0d6bb77dd81ecb12fa65f27a7f64d2138a",
+          "blockNumber": "24739500",
+          "timeStamp": "1774501151",
+          "from": "0x4070b7d82467b5d4fa29882dff6525f8ff1f879c",
+          "to": "0x03caa8f2f455a144fe7d811c0d7a15efaec1b50f",
+          "value": "6976680000000000",
+          "contractAddress": "",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "ETH",
+          "category": "external"
+        },
+        {
+          "hash": "0xc72a68bc5354c3604677c88e10d0d9d012d0bd2436c489cfe172316dacbb6a33",
+          "blockNumber": "24739502",
+          "timeStamp": "1774501175",
+          "from": "0xbb2f33f73ccc2c74e3fb9bb8eb75241ac15337e0",
+          "to": "0x03caa8f2f455a144fe7d811c0d7a15efaec1b50f",
+          "value": "2247704844840",
+          "contractAddress": "",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "ETH",
+          "category": "external"
+        }
+      ]
+    },
+    "erc20": {
+      "count": 0,
+      "rows": []
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

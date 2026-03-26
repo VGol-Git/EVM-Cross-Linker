@@ -1,0 +1,15 @@
+{
+  "chain": "polygon",
+  "window_blocks": 1,
+  "blocks_in_window": 1,
+  "blocks_fetched": 1,
+  "start_block": 84690560,
+  "end_block": 84690560,
+  "total_addresses_extracted": 208,
+  "pre_eoa_active": 149,
+  "pre_eoa_passive": 54,
+  "active_eoas": 146,
+  "passive_eoas": 8,
+  "total_eoas": 154,
+  "output_dir": "C:\\Users\\Pro\\Downloads\\blockchain_proj\\EVM-Cross-Linker\\data\\interim\\1blk\\polygon"
+}

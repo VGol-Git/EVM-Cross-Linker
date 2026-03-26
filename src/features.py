@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import pandas as pd
 
-from .api_client import EtherscanClient
+from .api_client import MultiProviderClient
 from .config import AppConfig, ChainConfig
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class AddressChainFeatureRecord:
     chain: str
     chain_id: int
     snapshot_ts: int
-    observation_window_days: int
+    observation_window_blocks: int
 
     native_tx_count: int
     erc20_transfer_count: int
@@ -222,7 +222,7 @@ def _address_activity_cache_path(app_config: AppConfig, chain: ChainConfig, addr
 
 
 def fetch_address_chain_activity(
-    client: EtherscanClient,
+    client: MultiProviderClient,
     app_config: AppConfig,
     chain: ChainConfig,
     address: str,
@@ -283,7 +283,7 @@ def fetch_address_chain_activity(
         "chain_id": chain.chain_id,
         "fetched_at": utc_now_iso(),
         "snapshot_ts": int(datetime.now(tz=timezone.utc).timestamp()),
-        "observation_window_days": app_config.sampling.observation_window_days,
+        "observation_window_blocks": app_config.sampling.observation_window_blocks,
         "max_pages_per_endpoint": max_pages_per_endpoint,
         "is_query_truncated": is_query_truncated,
         "endpoints": {
@@ -314,7 +314,7 @@ def _extract_feature_record_from_payload(payload: Dict[str, Any]) -> AddressChai
     chain = str(payload["chain"])
     chain_id = int(payload["chain_id"])
     snapshot_ts = int(payload["snapshot_ts"])
-    observation_window_days = int(payload.get("observation_window_days", 0))
+    observation_window_blocks = int(payload.get("observation_window_blocks", 0))
     is_query_truncated = bool(payload.get("is_query_truncated", False))
 
     endpoints = payload.get("endpoints", {})
@@ -424,7 +424,7 @@ def _extract_feature_record_from_payload(payload: Dict[str, Any]) -> AddressChai
     active_days = _distinct_calendar_days(all_timestamps)
     active_weeks = _distinct_calendar_weeks(all_timestamps)
     activity_density = (
-        active_days / observation_window_days if observation_window_days > 0 else 0.0
+        active_days / observation_window_blocks if observation_window_blocks > 0 else 0.0
     )
 
     mean_gap_seconds, median_gap_seconds = _compute_gap_stats(all_timestamps)
@@ -454,7 +454,7 @@ def _extract_feature_record_from_payload(payload: Dict[str, Any]) -> AddressChai
         chain=chain,
         chain_id=chain_id,
         snapshot_ts=snapshot_ts,
-        observation_window_days=observation_window_days,
+        observation_window_blocks=observation_window_blocks,
         native_tx_count=native_tx_count,
         erc20_transfer_count=erc20_transfer_count,
         internal_tx_count=internal_tx_count,
@@ -507,7 +507,7 @@ def compute_address_chain_features_from_cache(
 
 
 def fetch_and_compute_address_chain_features(
-    client: EtherscanClient,
+    client: MultiProviderClient,
     app_config: AppConfig,
     chain: ChainConfig,
     address: str,
@@ -546,7 +546,7 @@ def save_feature_dataframe(df: pd.DataFrame, path: str | Path) -> None:
 
 
 def build_feature_table_for_addresses(
-    client: EtherscanClient,
+    client: MultiProviderClient,
     app_config: AppConfig,
     addresses: Sequence[str],
     *,
@@ -617,7 +617,7 @@ def build_feature_table_for_addresses(
 
 
 def build_feature_table_from_seed_csv(
-    client: EtherscanClient,
+    client: MultiProviderClient,
     app_config: AppConfig,
     seed_csv_path: str | Path,
     *,

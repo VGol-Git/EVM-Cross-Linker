@@ -1,0 +1,40 @@
+{
+  "address": "0x02a86f51aa7b8b1c17c30364748d5ae4a0727e23",
+  "chain": "bnb",
+  "chain_id": 56,
+  "fetched_at": "2026-03-26T05:02:38.785762+00:00",
+  "snapshot_ts": 1774501358,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 1,
+      "rows": [
+        {
+          "hash": "0xd17dc04394e85867b42972f81914952edb16d73f00fa68e26169c348eedf4550",
+          "blockNumber": "49943455",
+          "timeStamp": "0",
+          "from": "0x7f24c219af99ae90c4188ec6b8c284ae58e64601",
+          "to": "0x02a86f51aa7b8b1c17c30364748d5ae4a0727e23",
+          "value": "5000000000000000000",
+          "contractAddress": "0x7f24c219af99ae90c4188ec6b8c284ae58e64601",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "AI",
+          "category": "erc20"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

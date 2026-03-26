@@ -1,0 +1,40 @@
+{
+  "address": "0x01f71c3f6c20e7e7f5b3a649f01cdb71db4f0f43",
+  "chain": "polygon",
+  "chain_id": 137,
+  "fetched_at": "2026-03-26T05:01:51.346281+00:00",
+  "snapshot_ts": 1774501311,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 1,
+      "rows": [
+        {
+          "hash": "0x22e37bad02b89fdf0d61f77f396ebdfa2c46e86feb6655cde17bb4f1535c1f6c",
+          "blockNumber": "83666404",
+          "timeStamp": "1772452839",
+          "from": "0x8129b737912e17212c8693b781928f5d0303390a",
+          "to": "0x01f71c3f6c20e7e7f5b3a649f01cdb71db4f0f43",
+          "value": "50",
+          "contractAddress": "0xc8c4db15e07d0f30558eaab922bf2631550a266e",
+          "input": "0x",
+          "gasPrice": "0",
+          "gasUsed": "0",
+          "isError": "0",
+          "asset": "REWARD 🎁 Visit: t .me/app_dydx",
+          "category": "erc20"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}

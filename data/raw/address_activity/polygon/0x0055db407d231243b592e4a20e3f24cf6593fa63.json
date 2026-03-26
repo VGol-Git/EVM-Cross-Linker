@@ -1,0 +1,48 @@
+{
+  "address": "0x0055db407d231243b592e4a20e3f24cf6593fa63",
+  "chain": "polygon",
+  "chain_id": 137,
+  "fetched_at": "2026-03-26T00:14:08.804976+00:00",
+  "snapshot_ts": 1774484048,
+  "observation_window_blocks": 1,
+  "max_pages_per_endpoint": 10,
+  "is_query_truncated": true,
+  "endpoints": {
+    "normal": {
+      "count": 0,
+      "rows": []
+    },
+    "erc20": {
+      "count": 1,
+      "rows": [
+        {
+          "blockNumber": "84620247",
+          "timeStamp": "1774360529",
+          "hash": "0x2416d5d8468b53496a34e1b3e0de3f0062f4ec8a2ab44c5e733d1200ace9d890",
+          "nonce": "38",
+          "blockHash": "0xe45948fec3c0244ea649fe23e9259fee092b6260307a44e78cf3f4f82f9a5acd",
+          "from": "0xdf2140dee6b07ae495382bc1cd446f7b328f63e3",
+          "contractAddress": "0x3c9ec34dcef14b212bec4269e60ba1e3adb48ef7",
+          "to": "0x0055db407d231243b592e4a20e3f24cf6593fa63",
+          "value": "50",
+          "tokenName": "REWARD 🎁 t .me/s/nft_paws",
+          "tokenSymbol": "REWARD 🎁 t .me/s/nft_paws",
+          "tokenDecimal": "0",
+          "transactionIndex": "106",
+          "gas": "1456065",
+          "gasPrice": "356539639314",
+          "gasUsed": "1443442",
+          "cumulativeGasUsed": "18763077",
+          "input": "deprecated",
+          "methodId": "0x729ad39e",
+          "functionName": "airdrop(address[] users)",
+          "confirmations": "61754"
+        }
+      ]
+    },
+    "internal": {
+      "count": 0,
+      "rows": []
+    }
+  }
+}
